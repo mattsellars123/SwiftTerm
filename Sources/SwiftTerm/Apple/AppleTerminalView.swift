@@ -2527,8 +2527,8 @@ extension TerminalView {
     /// terminal bytes or moving the live cursor. Payload decoding and stripe
     /// attachment are intentionally separate from the text critical path.
     @discardableResult
-    public func restoreKittyGraphicsSnapshot(_ snapshot: TerminalKittyGraphicsSnapshot) -> Bool {
-        guard terminal.installKittyGraphicsSnapshotState(snapshot) else { return false }
+    public func hydrateKittyGraphicsPayloads(_ payloads: TerminalKittyGraphicsPayloadSnapshot) -> Bool {
+        guard let snapshot = terminal.consumeKittyGraphicsPayloads(payloads) else { return false }
         let imagesByID = Dictionary(uniqueKeysWithValues: snapshot.images.map { ($0.id, $0) })
 
         func decodedImage(_ payload: TerminalKittyGraphicsSnapshot.Image.Payload) -> TTImage? {
