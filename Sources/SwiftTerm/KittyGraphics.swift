@@ -1780,7 +1780,9 @@ extension Terminal {
         for row in 0..<buffer.lines.count {
             guard let images = buffer.lines[row].images else { continue }
             let kept = images.filter { !($0 is KittyHeadlessPlacementImage) }
-            buffer.lines[row].images = kept.isEmpty ? nil : kept
+            guard kept.count != images.count else { continue }
+            buffer.clearImagesFromLine(at: row)
+            for image in kept { buffer.attachImage(image, toLineAt: row) }
         }
 
         let neededImages = payloads.images.filter { neededImageIDs.contains($0.id) }
