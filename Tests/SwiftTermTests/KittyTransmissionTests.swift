@@ -75,6 +75,29 @@ final class KittyTransmissionTests {
         return result.ok
     }
 
+    @Test func testDeferredSnapshotDoesNotResurrectPlacementDeletedBySuffix() throws {
+        let source = makeHeadlessTerminal().terminal!
+        sendKitty(
+            terminal: source,
+            control: "a=T,f=32,s=1,v=1,c=1,r=1,i=1,q=2,C=1",
+            payload: Data([0x7f, 0x7f, 0x7f, 0xff])
+        )
+        let snapshot = try #require(source.makeKittyGraphicsSnapshot(
+            firstInvariantRow: source.buffer.totalLinesTrimmed,
+            retainedLineCount: source.buffer.lines.count,
+            maximumPayloadBytes: 1024
+        ))
+        #expect(snapshot.placements.count == 1)
+
+        let target = makeHeadlessTerminal().terminal!
+        #expect(target.prepareKittyGraphicsManifest(snapshot.manifest))
+        target.feed(text: "\u{1b}[2J")
+        let surviving = try #require(target.consumeKittyGraphicsPayloads(snapshot.payloads))
+
+        #expect(surviving.placements.isEmpty)
+        #expect(surviving.images.isEmpty)
+    }
+
     @Test func testKittyTemporaryFileNameRejected() throws {
         let h = makeHeadlessTerminal()
         let t = h.terminal!
