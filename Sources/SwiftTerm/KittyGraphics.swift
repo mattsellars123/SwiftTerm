@@ -130,6 +130,64 @@ struct KittyGraphicsPending {
     var base64Payload: [UInt8]
 }
 
+/// A bounded, parser-owned snapshot of Kitty image payloads and their exact
+/// retained-line placements. Applications can transfer this independently of
+/// their text snapshot so image decoding never blocks first paint or input.
+public struct TerminalKittyGraphicsSnapshot: Codable, Equatable, Sendable {
+    public struct Image: Codable, Equatable, Sendable {
+        public enum Payload: Codable, Equatable, Sendable {
+            case png(Data)
+            case rgba(Data, width: Int, height: Int)
+        }
+
+        public let id: UInt32
+        public let number: UInt32?
+        public let payload: Payload
+    }
+
+    public struct Placement: Codable, Equatable, Sendable {
+        public let imageID: UInt32
+        public let imageNumber: UInt32?
+        public let placementID: UInt32
+        public let column: Int
+        public let relativeRow: Int
+        public let columns: Int
+        public let rows: Int
+        public let zIndex: Int
+        public let pixelOffsetX: Int
+        public let pixelOffsetY: Int
+    }
+
+    public let version: Int
+    public let retainedLineCount: Int
+    public let images: [Image]
+    public let placements: [Placement]
+
+    public init(version: Int = 1, retainedLineCount: Int, images: [Image], placements: [Placement]) {
+        self.version = version
+        self.retainedLineCount = retainedLineCount
+        self.images = images
+        self.placements = placements
+    }
+}
+
+private final class KittyHeadlessPlacementImage: KittyPlacementImage {
+    var kittyIsKitty = true
+    var kittyImageId: UInt32?
+    var kittyImageNumber: UInt32?
+    var kittyPlacementId: UInt32?
+    var kittyZIndex = 0
+    var kittyCol = 0
+    var kittyRow = 0
+    var kittyCols = 0
+    var kittyRows = 0
+    var kittyPixelOffsetX = 0
+    var kittyPixelOffsetY = 0
+    var col = 0
+    var pixelWidth: Int { 0 }
+    var pixelHeight: Int { 0 }
+}
+
 final class KittyGraphicsState {
     var imagesById: [UInt32: KittyGraphicsImage] = [:]
     var imageNumbers: [UInt32: UInt32] = [:]
@@ -1105,9 +1163,10 @@ extension Terminal {
             pixelOffsetY = min(pixelOffsetY, maxY)
         }
 
+        let resolvedPlacementId = control.placementId ?? nextKittyPlacementId()
         kittyPlacementContext = KittyPlacementContext(imageId: imageId ?? control.imageId,
                                                       imageNumber: imageNumber ?? control.imageNumber,
-                                                      placementId: control.placementId,
+                                                      placementId: resolvedPlacementId,
                                                       parentImageId: control.parentImageId,
                                                       parentPlacementId: control.parentPlacementId,
                                                       parentOffsetH: control.offsetH,
@@ -1126,8 +1185,8 @@ extension Terminal {
         let savedX = buffer.x
         let savedY = buffer.y
 
-        if let imageId = imageId, let placementId = control.placementId {
-            removeKittyPlacement(imageId: imageId, placementId: placementId)
+        if let imageId = imageId {
+            removeKittyPlacement(imageId: imageId, placementId: resolvedPlacementId)
         }
 
         if let col = origin.col, let row = origin.row {
@@ -1149,6 +1208,51 @@ extension Terminal {
             tdel?.createImage(source: self, data: data, width: widthRequest, height: heightRequest, preserveAspectRatio: preserveAspectRatio)
         case .rgba(var bytes, let width, let height):
             tdel?.createImageFromBitmap(source: self, bytes: &bytes, width: width, height: height)
+        }
+
+        // Headless terminals have no image renderer, but still need parsed
+        // placement state to remain authoritative. Synthetic line metadata is
+        // scrolled and trimmed by Buffer exactly like rendered image stripes.
+        if let imageId,
+           kittyGraphicsState.placementsByKey[KittyPlacementKey(imageId: imageId, placementId: resolvedPlacementId)] == nil,
+           let grid = kittyPlacementGridSize(payload: displayPayload,
+                                             widthRequest: widthRequest,
+                                             heightRequest: heightRequest,
+                                             preserveAspectRatio: preserveAspectRatio,
+                                             cellSize: tdel?.cellSizeInPixels(source: self),
+                                             pixelOffsetX: pixelOffsetX,
+                                             pixelOffsetY: pixelOffsetY) {
+            registerKittyPlacement(imageId: imageId,
+                                   placementId: resolvedPlacementId,
+                                   parentImageId: control.parentImageId,
+                                   parentPlacementId: control.parentPlacementId,
+                                   parentOffsetH: control.offsetH,
+                                   parentOffsetV: control.offsetV,
+                                   pixelOffsetX: pixelOffsetX,
+                                   pixelOffsetY: pixelOffsetY,
+                                   col: placementCol,
+                                   row: placementRow,
+                                   cols: grid.cols,
+                                   rows: grid.rows,
+                                   zIndex: control.zIndex,
+                                   isVirtual: false)
+            for rowOffset in 0..<grid.rows {
+                let targetRow = placementRow + rowOffset
+                guard targetRow >= 0, targetRow < buffer.lines.count else { continue }
+                let placeholder = KittyHeadlessPlacementImage()
+                placeholder.kittyImageId = imageId
+                placeholder.kittyImageNumber = imageNumber
+                placeholder.kittyPlacementId = resolvedPlacementId
+                placeholder.kittyZIndex = control.zIndex
+                placeholder.kittyCol = placementCol
+                placeholder.kittyRow = placementRow
+                placeholder.kittyCols = grid.cols
+                placeholder.kittyRows = grid.rows
+                placeholder.kittyPixelOffsetX = pixelOffsetX
+                placeholder.kittyPixelOffsetY = pixelOffsetY
+                placeholder.col = placementCol
+                buffer.attachImage(placeholder, toLineAt: targetRow)
+            }
         }
 
         if origin.isRelative || control.cursorPolicy == 1 {
@@ -1458,6 +1562,141 @@ extension Terminal {
             controlData += "I=\(number)"
         }
         sendResponse(cc.APC, "\(controlData);\(message)", cc.ST)
+    }
+
+    /// Exports exact Kitty payloads and placements wholly contained in the
+    /// retained text-snapshot line range. A nil result means the caller must
+    /// use its canonical fallback rather than paint an incomplete image state.
+    public func makeKittyGraphicsSnapshot(
+        firstInvariantRow: Int,
+        retainedLineCount: Int,
+        maximumPayloadBytes: Int
+    ) -> TerminalKittyGraphicsSnapshot? {
+        guard kittyGraphicsState.pending == nil,
+              retainedLineCount > 0,
+              maximumPayloadBytes >= 0 else { return nil }
+        updateKittyRelativePlacementsForCurrentBuffer()
+        let firstRow = firstInvariantRow - buffer.linesTop
+        let endRow = firstRow + retainedLineCount
+        guard firstRow >= 0, endRow <= buffer.lines.count else { return nil }
+
+        var keys = Set<KittyPlacementKey>()
+        for row in firstRow..<endRow {
+            guard let images = buffer.lines[row].images else { continue }
+            for image in images {
+                guard let kitty = image as? KittyPlacementImage,
+                      kitty.kittyIsKitty,
+                      let imageID = kitty.kittyImageId,
+                      let placementID = kitty.kittyPlacementId else { continue }
+                keys.insert(KittyPlacementKey(imageId: imageID, placementId: placementID))
+            }
+        }
+        if keys.isEmpty {
+            return TerminalKittyGraphicsSnapshot(retainedLineCount: retainedLineCount, images: [], placements: [])
+        }
+
+        var placements: [TerminalKittyGraphicsSnapshot.Placement] = []
+        var imageIDs = Set<UInt32>()
+        let numberByImageID = Dictionary(uniqueKeysWithValues: kittyGraphicsState.imageNumbers.map { ($0.value, $0.key) })
+        for key in keys.sorted(by: { ($0.imageId, $0.placementId) < ($1.imageId, $1.placementId) }) {
+            guard let record = kittyGraphicsState.placementsByKey[key],
+                  record.isAlternateBuffer == isCurrentBufferAlternate,
+                  !record.isVirtual,
+                  record.cols > 0,
+                  record.rows > 0,
+                  record.row >= firstRow,
+                  record.row + record.rows <= endRow else { return nil }
+            imageIDs.insert(record.imageId)
+            placements.append(.init(
+                imageID: record.imageId,
+                imageNumber: numberByImageID[record.imageId],
+                placementID: record.placementId,
+                column: record.col,
+                relativeRow: record.row - firstRow,
+                columns: record.cols,
+                rows: record.rows,
+                zIndex: record.zIndex,
+                pixelOffsetX: record.pixelOffsetX,
+                pixelOffsetY: record.pixelOffsetY
+            ))
+        }
+
+        var totalBytes = 0
+        var images: [TerminalKittyGraphicsSnapshot.Image] = []
+        for imageID in imageIDs.sorted() {
+            guard let image = kittyGraphicsState.imagesById[imageID] else { return nil }
+            let payload: TerminalKittyGraphicsSnapshot.Image.Payload
+            switch image.payload {
+            case .png(let data):
+                totalBytes += data.count
+                payload = .png(data)
+            case .rgba(let bytes, let width, let height):
+                totalBytes += bytes.count
+                payload = .rgba(Data(bytes), width: width, height: height)
+            }
+            guard totalBytes <= maximumPayloadBytes else { return nil }
+            images.append(.init(id: imageID, number: numberByImageID[imageID], payload: payload))
+        }
+        return TerminalKittyGraphicsSnapshot(
+            retainedLineCount: retainedLineCount,
+            images: images,
+            placements: placements
+        )
+    }
+
+    func installKittyGraphicsSnapshotState(_ snapshot: TerminalKittyGraphicsSnapshot) -> Bool {
+        guard snapshot.version == 1,
+              snapshot.retainedLineCount > 0,
+              snapshot.retainedLineCount <= buffer.lines.count else { return false }
+        clearAllKittyImages()
+        var totalBytes = 0
+        for image in snapshot.images {
+            let payload: KittyGraphicsPayload
+            let byteSize: Int
+            switch image.payload {
+            case .png(let data):
+                payload = .png(data)
+                byteSize = data.count
+            case .rgba(let data, let width, let height):
+                guard width > 0, height > 0, data.count == width * height * 4 else { return false }
+                payload = .rgba(bytes: Array(data), width: width, height: height)
+                byteSize = data.count
+            }
+            totalBytes += byteSize
+            guard totalBytes <= clampedKittyImageCacheLimitBytes() else { return false }
+            kittyGraphicsState.imagesById[image.id] = KittyGraphicsImage(
+                payload: payload,
+                byteSize: byteSize,
+                lastAccessTick: nextKittyImageAccessTick()
+            )
+            if let number = image.number { kittyGraphicsState.imageNumbers[number] = image.id }
+        }
+        kittyGraphicsState.totalImageBytes = totalBytes
+        let imageIDs = Set(snapshot.images.map(\.id))
+        for placement in snapshot.placements {
+            guard imageIDs.contains(placement.imageID),
+                  placement.columns > 0,
+                  placement.rows > 0,
+                  placement.relativeRow >= 0,
+                  placement.relativeRow + placement.rows <= snapshot.retainedLineCount else { return false }
+            registerKittyPlacement(
+                imageId: placement.imageID,
+                placementId: placement.placementID,
+                parentImageId: nil,
+                parentPlacementId: nil,
+                parentOffsetH: 0,
+                parentOffsetV: 0,
+                pixelOffsetX: placement.pixelOffsetX,
+                pixelOffsetY: placement.pixelOffsetY,
+                col: placement.column,
+                row: placement.relativeRow,
+                cols: placement.columns,
+                rows: placement.rows,
+                zIndex: placement.zIndex,
+                isVirtual: false
+            )
+        }
+        return true
     }
 
     func clearAllKittyImages() {

@@ -2523,6 +2523,92 @@ extension TerminalView {
         }
     }
     
+    /// Restores a parser-owned Kitty snapshot without replaying historical
+    /// terminal bytes or moving the live cursor. Payload decoding and stripe
+    /// attachment are intentionally separate from the text critical path.
+    @discardableResult
+    public func restoreKittyGraphicsSnapshot(_ snapshot: TerminalKittyGraphicsSnapshot) -> Bool {
+        guard terminal.installKittyGraphicsSnapshotState(snapshot) else { return false }
+        let imagesByID = Dictionary(uniqueKeysWithValues: snapshot.images.map { ($0.id, $0) })
+
+        func decodedImage(_ payload: TerminalKittyGraphicsSnapshot.Image.Payload) -> TTImage? {
+            switch payload {
+            case .png(let data):
+                return TTImage(data: data)
+            case .rgba(let data, let width, let height):
+                guard data.count == width * height * 4 else { return nil }
+                let colorSpace = CGColorSpaceCreateDeviceRGB()
+                let bitmapInfo = CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue)
+                guard let provider = CGDataProvider(data: data as CFData),
+                      let cgImage = CGImage(
+                        width: width,
+                        height: height,
+                        bitsPerComponent: 8,
+                        bitsPerPixel: 32,
+                        bytesPerRow: width * 4,
+                        space: colorSpace,
+                        bitmapInfo: bitmapInfo,
+                        provider: provider,
+                        decode: nil,
+                        shouldInterpolate: true,
+                        intent: .defaultIntent
+                      ) else { return nil }
+                return TTImage(cgImage: cgImage, size: CGSize(width: width, height: height))
+            }
+        }
+
+        for placement in snapshot.placements {
+            guard let encoded = imagesByID[placement.imageID],
+                  let sourceImage = decodedImage(encoded.payload) else { return false }
+            let width = cellDimension.width * CGFloat(placement.columns)
+            let height = cellDimension.height * CGFloat(placement.rows)
+            let image = scale(image: sourceImage, size: CGSize(width: width, height: height))
+            let stripeSize = CGSize(width: width, height: cellDimension.height)
+            let heightRatio = image.size.height / height
+            #if os(iOS) || os(visionOS)
+            var sourceY: CGFloat = 0
+            #else
+            var sourceY: CGFloat = image.size.height
+            #endif
+            for rowOffset in 0..<placement.rows {
+                #if os(macOS)
+                sourceY -= cellDimension.height * heightRatio
+                #endif
+                guard let stripe = drawImageInStripe(
+                    image: image,
+                    srcY: sourceY,
+                    width: width,
+                    srcHeight: cellDimension.height * heightRatio,
+                    dstHeight: cellDimension.height,
+                    size: stripeSize
+                ) else { return false }
+                #if os(iOS) || os(visionOS)
+                sourceY += cellDimension.height * heightRatio
+                #endif
+                let attached = AppleImage(
+                    image: stripe,
+                    width: Int(stripeSize.width),
+                    height: Int(cellDimension.height),
+                    onCol: placement.column
+                )
+                attached.kittyIsKitty = true
+                attached.kittyImageId = placement.imageID
+                attached.kittyImageNumber = placement.imageNumber
+                attached.kittyPlacementId = placement.placementID
+                attached.kittyZIndex = placement.zIndex
+                attached.kittyCol = placement.column
+                attached.kittyRow = placement.relativeRow
+                attached.kittyCols = placement.columns
+                attached.kittyRows = placement.rows
+                attached.kittyPixelOffsetX = placement.pixelOffsetX
+                attached.kittyPixelOffsetY = placement.pixelOffsetY
+                terminal.buffer.attachImage(attached, toLineAt: placement.relativeRow + rowOffset)
+            }
+        }
+        terminal.updateFullScreen()
+        return true
+    }
+
     /// Set to true if the selection is active, false otherwise
     public var selectionActive: Bool {
         get {
