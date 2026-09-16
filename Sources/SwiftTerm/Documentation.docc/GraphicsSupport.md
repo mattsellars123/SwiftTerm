@@ -93,6 +93,33 @@ timg -pk image.png
 Kitty images are cached in memory for re-display. Control the cache size with
 ``TerminalOptions/kittyImageCacheLimitBytes``, which defaults to 320 MB.
 
+### Two-Phase Hosted Rendering
+
+Terminals fed from another process (for example a daemon-hosted session)
+can opt into two-phase Kitty rendering with
+``TerminalOptions/hostedKittyTwoPhaseRendering``. The parser then records
+cursor-anchored placements and enqueues immutable decode tickets instead of
+decoding inline; ``prepareHostedKittyRender`` rasterizes tickets on any
+background executor, and ``Terminal/installHostedKittyPreparedImages``
+atomically validates and installs prepared batches on the feeding thread.
+Per-payload admission is bounded by
+``TerminalOptions/kittyHostedPayloadLimitBytes`` (8 MB by default). Custom
+front-ends additionally implement
+``TerminalDelegate/attachPreparedKittyImage(source:prepared:)`` to swap
+placeholder rows for stripes.
+
+With the flag enabled the terminal keeps a strict responsive profile:
+only direct transmit-and-display (`a=T,t=d`) is retained. Stored
+transfers, store-then-place, queries, file-backed transmissions, and
+deletes are rejected with typed errors before any payload or placement
+mutation, instead of falling back to synchronous decode, file I/O,
+scaling, stripe rendering, or shared-state removal on the feeding thread.
+Placement lifecycle in hosted mode is fully internal: scrollback-dead
+records are reaped, unanchored virtual/store-only records are evicted
+oldest-first past a count cap, anonymous displays evict oldest-first,
+and reset retires everything. The flag off preserves the legacy inline
+behavior unchanged.
+
 ## Implementing Graphics in a Custom Front-End
 
 If you are building a custom front-end (not using the bundled AppKit/UIKit views),

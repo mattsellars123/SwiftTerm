@@ -179,10 +179,16 @@ extension TerminalView {
         self.cellDimension = computeFontDimensions ()
 
         let zeroSizedView = width == 0 && height == 0
-        let terminalOptions = zeroSizedView
-            ? (terminal?.options ?? .default)
-            : TerminalOptions(cols: Int(width / cellDimension.width),
-                              rows: Int(height / cellDimension.height))
+        // Rebuilding options for new geometry carries every prior option
+        // forward and only overwrites the dimensions, so no configured
+        // behavior (Kitty budgets, palette strategy, tab stops, regional
+        // indicator width, two-phase opt-in) resets on resize or setup.
+        let priorOptions = terminal?.options ?? .default
+        var terminalOptions = priorOptions
+        if !zeroSizedView {
+            terminalOptions.cols = Int(width / cellDimension.width)
+            terminalOptions.rows = Int(height / cellDimension.height)
+        }
 
         if terminal == nil {
             terminal = Terminal(delegate: self, options: terminalOptions)
@@ -2603,6 +2609,131 @@ extension TerminalView {
                 attached.kittyPixelOffsetX = placement.pixelOffsetX
                 attached.kittyPixelOffsetY = placement.pixelOffsetY
                 terminal.buffer.attachImage(attached, toLineAt: placement.relativeRow + rowOffset)
+            }
+        }
+        terminal.updateFullScreen()
+        return true
+    }
+
+    /// Swaps the headless placeholder rows recorded by the two-phase hosted
+    /// parser for precomputed stripes. Runs synchronously inside
+    /// `Terminal.installHostedKittyPreparedImages` after the batch passed
+    /// epoch, placement, and source-plus-rendered cache validation, so the
+    /// placeholders located here are guaranteed to exist. Only view-object
+    /// creation happens here: every stripe arrives as finished RGBA bytes
+    /// from the background prepare step. No PNG-decode, scaling, or stripe
+    /// slicing runs on this path.
+    ///
+    /// Surviving lines are located by key scan and stripe indices are
+    /// anchored with `originLinesTop`, so scrollback trimming between parse
+    /// and install cannot mis-slice the image. Mapping is validated for all
+    /// lines before anything mutates: an out-of-range surviving placeholder
+    /// reports failure with the buffer untouched (the install then rolls the
+    /// whole batch back and rebuilds placeholders, so a retry is safe).
+    public func attachPreparedKittyImage(source: Terminal, prepared: HostedKittyPreparedImage) -> Bool {
+        guard prepared.isAlternateBuffer == terminal.isCurrentBufferAlternate,
+              prepared.width > 0, prepared.height > 0,
+              prepared.rgba.count == prepared.width * prepared.height * 4,
+              prepared.columns > 0, prepared.rows > 0,
+              prepared.stripes.count == prepared.rows,
+              !prepared.stripes.isEmpty else {
+            return false
+        }
+        var stagedCost = 0
+        for stripe in prepared.stripes {
+            guard stripe.width > 0, stripe.height > 0,
+                  stripe.rgba.count == stripe.width * stripe.height * 4 else {
+                return false
+            }
+            stagedCost += stripe.rgba.count
+        }
+        guard stagedCost == prepared.renderedByteCost else {
+            return false
+        }
+        // Stage view objects from precomputed bytes. CGImage/TTImage creation
+        // wraps the buffers without rasterizing them.
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        let bitmapInfo = CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue)
+        let stripePointSize = CGSize(width: cellDimension.width * CGFloat(prepared.columns),
+                                     height: cellDimension.height)
+        var staged: [TTImage] = []
+        staged.reserveCapacity(prepared.stripes.count)
+        for stripe in prepared.stripes {
+            guard let provider = CGDataProvider(data: stripe.rgba as CFData),
+                  let cgImage = CGImage(width: stripe.width,
+                                        height: stripe.height,
+                                        bitsPerComponent: 8,
+                                        bitsPerPixel: 32,
+                                        bytesPerRow: stripe.width * 4,
+                                        space: colorSpace,
+                                        bitmapInfo: bitmapInfo,
+                                        provider: provider,
+                                        decode: nil,
+                                        shouldInterpolate: true,
+                                        intent: .defaultIntent) else {
+                return false
+            }
+            staged.append(TTImage(cgImage: cgImage, size: stripePointSize))
+        }
+        // Map every surviving placeholder line to its stripe index first. No
+        // mutation happens here: any out-of-range line fails before attach.
+        var placeholderLines: [Int] = []
+        for row in 0..<terminal.buffer.lines.count {
+            guard let images = terminal.buffer.lines[row].images else { continue }
+            for candidate in images {
+                if let kitty = candidate as? KittyPlacementImage,
+                   candidate is KittyHeadlessPlacementImage,
+                   kitty.kittyImageId == prepared.imageId,
+                   kitty.kittyPlacementId == prepared.placementId {
+                    placeholderLines.append(row)
+                    break
+                }
+            }
+        }
+        guard !placeholderLines.isEmpty else { return false }
+        // Absolute-coordinate stripe index: the parse-time anchor row plus
+        // `originLinesTop` is the stable absolute coordinate of the
+        // placement's first row. Exact under scroll and scrollback trimming.
+        let anchorAbsoluteRow = prepared.anchorRow + prepared.originLinesTop
+        var stripeByLine: [Int: Int] = [:]
+        for line in placeholderLines {
+            let stripeIndex = (line + terminal.buffer.linesTop) - anchorAbsoluteRow
+            guard stripeIndex >= 0, stripeIndex < prepared.rows else {
+                return false
+            }
+            stripeByLine[line] = stripeIndex
+        }
+        // Commit: attach staged stripes, then remove the placeholders they
+        // replaced. Indices were validated above, so every line commits.
+        for line in placeholderLines {
+            guard let stripeIndex = stripeByLine[line] else { continue }
+            let attached = AppleImage(image: staged[stripeIndex],
+                                      width: Int(stripePointSize.width),
+                                      height: Int(stripePointSize.height),
+                                      onCol: prepared.anchorCol)
+            attached.kittyIsKitty = true
+            attached.kittyImageId = prepared.imageId
+            attached.kittyImageNumber = prepared.imageNumber
+            attached.kittyPlacementId = prepared.placementId
+            attached.kittyZIndex = prepared.zIndex
+            attached.kittyCol = prepared.anchorCol
+            attached.kittyRow = prepared.anchorRow
+            attached.kittyCols = prepared.columns
+            attached.kittyRows = prepared.rows
+            attached.kittyPixelOffsetX = prepared.pixelOffsetX
+            attached.kittyPixelOffsetY = prepared.pixelOffsetY
+            terminal.buffer.attachImage(attached, toLineAt: line)
+        }
+        for line in placeholderLines {
+            guard let images = terminal.buffer.lines[line].images else { continue }
+            let kept = images.filter { candidate in
+                guard let kitty = candidate as? KittyPlacementImage,
+                      candidate is KittyHeadlessPlacementImage else { return true }
+                return !(kitty.kittyImageId == prepared.imageId && kitty.kittyPlacementId == prepared.placementId)
+            }
+            terminal.buffer.clearImagesFromLine(at: line)
+            for keptImage in kept {
+                terminal.buffer.attachImage(keptImage, toLineAt: line)
             }
         }
         terminal.updateFullScreen()

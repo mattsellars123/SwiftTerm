@@ -12,9 +12,6 @@ import WinSDK
 #else
 import Darwin
 #endif
-#if canImport(Compression)
-import Compression
-#endif
 #if canImport(CoreGraphics)
 import CoreGraphics
 #endif
@@ -212,7 +209,10 @@ public struct TerminalKittyGraphicsPayloadSnapshot: Codable, Equatable, Sendable
     }
 }
 
-private final class KittyHeadlessPlacementImage: KittyPlacementImage {
+/// Headless placeholder rows for Kitty placements. Internal (not private)
+/// so the two-phase hosted transaction and view stripe installation can
+/// recognize and replace them.
+final class KittyHeadlessPlacementImage: KittyPlacementImage {
     var kittyIsKitty = true
     var kittyImageId: UInt32?
     var kittyImageNumber: UInt32?
@@ -238,6 +238,16 @@ final class KittyGraphicsState {
     var placementsByKey: [KittyPlacementKey: KittyPlacementRecord] = [:]
     var totalImageBytes: Int = 0
     var nextImageAccessTick: UInt64 = 1
+    /// Retained precomputed-stripe bytes per hosted placement key. Only the
+    /// two-phase install records costs here; legacy inline stripes are not
+    /// tracked. Released on placement removal, buffer clears, and reset.
+    var renderedStripeBytesByKey: [KittyPlacementKey: Int] = [:]
+    var totalRenderedStripeBytes: Int = 0
+    /// Live anonymous (untagged `a=T`) placement keys, oldest first.
+    /// Anonymous placements carry ephemeral ids the client never learns, so
+    /// they cannot be addressed for deletion; the parser evicts the oldest
+    /// past the configured bound to keep the lifecycle strictly bounded.
+    var anonymousPlacementKeys: [KittyPlacementKey] = []
 }
 
 extension Terminal {
@@ -250,11 +260,34 @@ extension Terminal {
             return
         }
 
-        if control.action == "d" || control.action == "D" {
+        // Earliest strict gate for two-phase mode: only effective direct
+        // transmit-and-display continues. Every other workflow rejects in
+        // order here, before partial payload mutation, reassembly copies,
+        // or placement state changes, so a rejection retains zero bytes,
+        // jobs, or state. Flag-off behavior is unchanged below.
+        if options.hostedKittyTwoPhaseRendering {
+            guard control.action == "T", control.transmission == "d" else {
+                sendStrictHostedRejection(control: control)
+                return
+            }
+        } else if control.action == "d" || control.action == "D" {
             kittyGraphicsState.pending = nil
         }
 
         if control.more == 1 {
+            // Bounded partial transfers while two-phase rendering is enabled:
+            // every chunk append is admitted before mutation so an open m=1
+            // transfer cannot retain unbounded bytes inside the terminal.
+            // The legacy path is unchanged when the flag is off.
+            if options.hostedKittyTwoPhaseRendering {
+                let limits = hostedKittyLimits()
+                let current = kittyGraphicsState.pending?.base64Payload.count ?? 0
+                guard hostedEncodedFits(current: current, additional: payload.count, limit: limits.maxPartialEncodedBytes) else {
+                    kittyGraphicsState.pending = nil
+                    sendKittyError(control: control, message: "EOVERFLOW: hosted transfer too large")
+                    return
+                }
+            }
             if kittyGraphicsState.pending == nil {
                 kittyGraphicsState.pending = KittyGraphicsPending(control: control, base64Payload: Array(payload))
             } else {
@@ -264,12 +297,32 @@ extension Terminal {
         }
 
         if var pending = kittyGraphicsState.pending {
+            // Final reassembly is capped before the copy, using the same
+            // subtractive bound as chunk appends; downstream admission then
+            // re-checks the total without ever holding an over-limit copy.
+            if options.hostedKittyTwoPhaseRendering {
+                let limits = hostedKittyLimits()
+                guard hostedEncodedFits(current: pending.base64Payload.count, additional: payload.count, limit: limits.maxPartialEncodedBytes) else {
+                    kittyGraphicsState.pending = nil
+                    sendKittyError(control: pending.control, message: "EOVERFLOW: hosted transfer too large")
+                    return
+                }
+            }
             pending.base64Payload.append(contentsOf: payload)
             kittyGraphicsState.pending = nil
             processKittyGraphics(control: pending.control, base64Payload: pending.base64Payload)
             return
         }
 
+        // Standalone payloads are capped before the Array copy for the same
+        // reason; the legacy path is unchanged when the flag is off.
+        if options.hostedKittyTwoPhaseRendering {
+            let limits = hostedKittyLimits()
+            guard hostedEncodedFits(current: 0, additional: payload.count, limit: limits.maxPartialEncodedBytes) else {
+                sendKittyError(control: control, message: "EOVERFLOW: hosted transfer too large")
+                return
+            }
+        }
         processKittyGraphics(control: control, base64Payload: Array(payload))
     }
 
@@ -403,6 +456,21 @@ extension Terminal {
         }
     }
 
+    /// Typed in-order rejection for workflows the strict hosted profile does
+    /// not retain. Known Kitty actions get ENOTSUP (no synchronous decode,
+    /// file I/O, scaling, stripe rendering, or placement mutation exists for
+    /// them in hosted mode); unknown actions keep the legacy EINVAL.
+    /// Called before any payload or placement mutation, so rejections retain
+    /// zero bytes, jobs, or state.
+    private func sendStrictHostedRejection(control: KittyGraphicsControl) {
+        switch control.action {
+        case "q", "t", "T", "p", "d", "D":
+            sendKittyError(control: control, message: "ENOTSUP: hosted mode supports only direct transmit-and-display (a=T,t=d)")
+        default:
+            sendKittyError(control: control, message: "EINVAL: unsupported action")
+        }
+    }
+
     private func handleKittyQuery(control: KittyGraphicsControl, base64Payload: [UInt8]) {
         guard decodeKittyPayload(control: control, base64Payload: base64Payload) != nil else {
             sendKittyError(control: control, message: "EINVAL: bad payload")
@@ -414,6 +482,14 @@ extension Terminal {
     private func handleKittyTransmit(control: KittyGraphicsControl, base64Payload: [UInt8], display: Bool) {
         guard control.imageId == nil || control.imageNumber == nil else {
             sendKittyError(control: control, message: "EINVAL: i and I are mutually exclusive")
+            return
+        }
+        // Two-phase mode pre-gates at handleKittyGraphics, so reaching here
+        // with the flag on always means effective direct transmit-and-display.
+        // After validation: the deferred path must accept exactly what the
+        // inline path accepts, so shared guards stay above this line.
+        if display, options.hostedKittyTwoPhaseRendering {
+            handleHostedKittyTransmitDirect(control: control, base64Payload: base64Payload)
             return
         }
 
@@ -515,8 +591,13 @@ extension Terminal {
                 sendKittyError(control: control, message: "EINVAL: missing id range")
                 return
             }
-            let minId = UInt32(min(control.cropX, control.cropY))
-            let maxId = UInt32(max(control.cropX, control.cropY))
+            // Exact conversion: ids outside UInt32 range reject instead of
+            // trapping on untrusted control ints.
+            guard let minId = UInt32(exactly: min(control.cropX, control.cropY)),
+                  let maxId = UInt32(exactly: max(control.cropX, control.cropY)) else {
+                sendKittyError(control: control, message: "EINVAL: bad id range")
+                return
+            }
             deletePlacementsByImageIdRange(minId: minId, maxId: maxId)
         default:
             sendKittyError(control: control, message: "EINVAL: unsupported delete")
@@ -757,6 +838,11 @@ extension Terminal {
             }
             let expected = control.width * control.height * 3
             guard rawData.count == expected else {
+                return nil
+            }
+            // Checked expansion cost before allocating the RGBA buffer: the
+            // source check above bounds 3-byte pixels, not the 4-byte output.
+            guard Int64(control.width) * Int64(control.height) * 4 <= Int64(Terminal.kittyMaxImageBytes) else {
                 return nil
             }
             var rgba = [UInt8]()
@@ -1338,8 +1424,13 @@ extension Terminal {
                                                                  visiting: &visiting) else {
             return (nil, nil, true, "ENOPARENT: parent placement not found")
         }
-        let col = parentPosition.col + control.offsetH
-        let row = parentPosition.row + control.offsetV
+        // Checked parent-relative arithmetic: untrusted H/V offsets must
+        // never trap. Overflows reject before any placement mutation.
+        let (col, colOverflow) = parentPosition.col.addingReportingOverflow(control.offsetH)
+        let (row, rowOverflow) = parentPosition.row.addingReportingOverflow(control.offsetV)
+        guard !colOverflow, !rowOverflow else {
+            return (nil, nil, true, "EINVAL: parent offset out of range")
+        }
         return (col, row, true, nil)
     }
 
@@ -1412,8 +1503,15 @@ extension Terminal {
                                                              positions: positions,
                                                              resolved: &resolved,
                                                              visiting: &visiting) {
-                base = (row: parentPos.row + record.parentOffsetV,
-                        col: parentPos.col + record.parentOffsetH)
+                // Checked recursive accumulation: a stored absurd offset
+                // unresolves the placement instead of trapping.
+                let (row, rowOverflow) = parentPos.row.addingReportingOverflow(record.parentOffsetV)
+                let (col, colOverflow) = parentPos.col.addingReportingOverflow(record.parentOffsetH)
+                if rowOverflow || colOverflow {
+                    base = nil
+                } else {
+                    base = (row: row, col: col)
+                }
             } else {
                 base = nil
             }
@@ -1540,6 +1638,9 @@ extension Terminal {
                                 zIndex: Int,
                                 isVirtual: Bool) {
         let key = KittyPlacementKey(imageId: imageId, placementId: placementId)
+        // Re-registration replaces any retained stripes recorded by a prior
+        // install; the install re-notes the new cost on success.
+        releaseRenderedStripeCost(keys: [key])
         let record = KittyPlacementRecord(imageId: imageId,
                                           placementId: placementId,
                                           parentImageId: parentImageId,
@@ -1564,11 +1665,12 @@ extension Terminal {
         }
         let removedKeys = removeKittyPlacements(in: normalBuffer, lineRange: 0..<normalBuffer.lines.count, predicate: predicate)
         let altRemoved = removeKittyPlacements(in: altBuffer, lineRange: 0..<altBuffer.lines.count, predicate: predicate)
-        let combined = removedKeys.union(altRemoved)
+        var combined = removedKeys.union(altRemoved)
+        combined.insert(KittyPlacementKey(imageId: imageId, placementId: placementId))
         for key in combined {
             kittyGraphicsState.placementsByKey.removeValue(forKey: key)
         }
-        kittyGraphicsState.placementsByKey.removeValue(forKey: KittyPlacementKey(imageId: imageId, placementId: placementId))
+        releaseRenderedStripeCost(keys: combined)
     }
 
     private func sendKittyOk(control: KittyGraphicsControl, imageId: UInt32?, imageNumber: UInt32?, placementId: UInt32?) {
@@ -1603,6 +1705,24 @@ extension Terminal {
             controlData += "I=\(number)"
         }
         sendResponse(cc.APC, "\(controlData);\(message)", cc.ST)
+    }
+
+    /// Terminal for a parser-level hosted overflow: the Kitty APC exceeded
+    /// the configured encoded cap while accumulating, so its tail was
+    /// dropped pre-parse and nothing was dispatched. Emits one typed
+    /// EOVERFLOW honoring the retained control prefix (suppression plus
+    /// image ids for correlation), clears any open partial transfer from
+    /// earlier chunks, and retains zero payload or placement state.
+    /// Flag-off terminals never reach here (the parser does not cap).
+    func rejectHostedApcOverflow(contentPrefix: ArraySlice<UInt8>) {
+        let limits = hostedKittyLimits()
+        kittyGraphicsState.pending = nil
+        let message = "EOVERFLOW: hosted transfer too large (\(limits.maxPartialEncodedBytes) byte cap)"
+        guard !contentPrefix.isEmpty, let (control, _) = parseKittyGraphicsControl(contentPrefix) else {
+            sendResponse(cc.APC, "G;\(message)", cc.ST)
+            return
+        }
+        sendKittyError(control: control, message: message)
     }
 
     /// Exports exact Kitty payloads and placements wholly contained in the
@@ -1816,7 +1936,404 @@ extension Terminal {
         )
     }
 
+    /// Two-phase hosted handler for transmit-and-display with a direct
+    /// payload. Always consumes the sequence when two-phase rendering is
+    /// enabled: eligible transmissions record cursor-anchored placement,
+    /// attach headless placeholder rows, advance the cursor exactly like the
+    /// inline path, and enqueue an immutable decode ticket carrying every
+    /// geometry preparation needs. Ineligible transmissions get a typed
+    /// in-order rejection. Nothing here decodes image bytes, scales, or
+    /// creates stripes, and nothing falls through to the legacy synchronous
+    /// inline decoder.
+    ///
+    /// Must run on the feeding thread: it shares parser, cursor, and buffer
+    /// state with every other feed operation. Admission passes before image-id
+    /// assignment, placement registration, placeholder creation, and enqueue,
+    /// so a rejected sequence mutates nothing.
+    private func handleHostedKittyTransmitDirect(control: KittyGraphicsControl, base64Payload: [UInt8]) {
+        assert(recordHostedFeedingThread())
+        let limits = hostedKittyLimits()
+        func reject(_ message: String) {
+            sendKittyError(control: control, message: message)
+        }
+        guard control.format == 100 || control.format == 24 || control.format == 32 else {
+            reject("EINVAL: unsupported format")
+            return
+        }
+        guard control.compression == nil || control.compression == "z" else {
+            reject("EINVAL: unsupported compression")
+            return
+        }
+        let isVirtual = control.unicodePlaceholder == 1
+        if isVirtual, control.parentImageId != nil || control.parentPlacementId != nil {
+            reject("EINVAL: virtual placement cannot refer to parent")
+            return
+        }
+        // Queue admission before any mutation: hosts rely on exact
+        // pending-job/byte accounting for their watermarks.
+        switch admitHostedRenderRequest(encodedBytes: base64Payload.count) {
+        case .admitted:
+            break
+        case .rejected(let reason):
+            switch reason {
+            case .partialTransferTooLarge(let bytes, let limit),
+                    .payloadTooLarge(let bytes, let limit):
+                reject("EOVERFLOW: hosted payload too large (\(bytes) > \(limit))")
+            case .pendingQueueFull(let jobs, let limit):
+                reject("EBUSY: hosted queue full (\(jobs) >= \(limit))")
+            case .pendingQueueBytesFull(let bytes, let limit):
+                reject("EBUSY: hosted queue bytes full (\(bytes) > \(limit))")
+            }
+            return
+        }
+        // Parent origin resolves against live records exactly like the inline
+        // path; errors precede all mutation.
+        let origin = resolveKittyPlacementOrigin(control: control)
+        if let errorMessage = origin.errorMessage {
+            reject(errorMessage)
+            return
+        }
+        // Placement-metadata bounds after all pure validation, before any
+        // mutation: reaps scrollback-dead records and evicts unanchored
+        // virtual/store-only records past the count cap.
+        guard enforceHostedPlacementBounds() else {
+            reject("EBUSY: hosted placements full")
+            return
+        }
+        let cellSize = tdel?.cellSizeInPixels(source: self)
+        // Requested pixel offsets are untrusted: clamp into a sane range up
+        // front so grid math can never trap near Int.max. A later view-size
+        // clamp still applies for view-backed terminals.
+        let reqOffsetX = min(max(0, control.pixelOffsetX), limits.maxImageDimension)
+        let reqOffsetY = min(max(0, control.pixelOffsetY), limits.maxImageDimension)
+        // Placement grid without decoding: explicit cells apply directly;
+        // auto dimensions derive from raw `s=`/`v=` or, for PNG, from a
+        // bounded header-only sniff (no raster decode). A nil grid means a
+        // headless auto-size display, which the inline path renders as a
+        // store-only no-op: the ticket still carries the payload for storage.
+        let grid: (cols: Int, rows: Int)?
+        if isVirtual {
+            grid = nil
+        } else if control.columns > 0, control.rows > 0 {
+            grid = (control.columns, control.rows)
+        } else if control.format == 100 {
+            // Compressed auto-size PNG cannot be gridded without inflating
+            // on the feeding thread, so it gets an explicit ENOTSUP (never
+            // a misleading EINVAL from a failed sniff of zlib bytes).
+            if control.compression != nil && (control.columns == 0 || control.rows == 0) {
+                reject("ENOTSUP: compressed auto-size PNG requires explicit c=/r= in hosted mode")
+                return
+            }
+            if cellSize == nil {
+                grid = nil
+            } else if let sniffed = hostedSniffPNGDimensions(base64Payload: base64Payload) {
+                grid = hostedPlacementGrid(imageWidth: sniffed.width, imageHeight: sniffed.height,
+                                            columns: control.columns, rows: control.rows,
+                                            cellSize: cellSize,
+                                            pixelOffsetX: reqOffsetX,
+                                            pixelOffsetY: reqOffsetY)
+                if grid == nil {
+                    reject("EINVAL: bad dimensions")
+                    return
+                }
+            } else {
+                reject("EINVAL: bad payload")
+                return
+            }
+        } else {
+            guard HostedKittyImageDecoder.validateDimensions(width: control.width, height: control.height, maxDimension: limits.maxImageDimension) else {
+                reject("EINVAL: bad dimensions")
+                return
+            }
+            grid = hostedPlacementGrid(imageWidth: control.width, imageHeight: control.height,
+                                        columns: control.columns, rows: control.rows,
+                                        cellSize: cellSize,
+                                        pixelOffsetX: reqOffsetX,
+                                        pixelOffsetY: reqOffsetY)
+            if grid == nil, cellSize != nil {
+                reject("EINVAL: bad dimensions")
+                return
+            }
+        }
+        let cols = grid?.cols ?? 0
+        let rows = grid?.rows ?? 0
+        if let grid {
+            // Checked area product: control ints are untrusted and must
+            // never trap near Int.max.
+            let (cells, cellsOverflow) = grid.cols.multipliedReportingOverflow(by: grid.rows)
+            guard grid.cols <= limits.maxImageDimension,
+                  grid.rows <= limits.maxImageDimension,
+                  !cellsOverflow, cells <= limits.maxPlacementCells else {
+                reject("EOVERFLOW: placement too large")
+                return
+            }
+        }
+        // Image identity: explicit `i=`/`I=` mirror the inline resolver;
+        // anonymous display takes an ephemeral internal id (stored nowhere,
+        // replied nowhere), matching inline transient semantics.
+        let imageId: UInt32
+        let imageNumber: UInt32?
+        let shouldReply: Bool
+        let isAnonymous: Bool
+        if let id = control.imageId {
+            imageId = id
+            imageNumber = nil
+            shouldReply = control.suppressResponses == 0
+            isAnonymous = false
+        } else if control.imageNumber != nil {
+            let resolved = resolveKittyImageId(control: control)
+            guard let id = resolved.imageId else {
+                reject("EINVAL: bad payload")
+                return
+            }
+            imageId = id
+            imageNumber = resolved.imageNumber
+            shouldReply = resolved.shouldReply
+            isAnonymous = false
+        } else {
+            imageId = kittyGraphicsState.nextImageId
+            kittyGraphicsState.nextImageId &+= 1
+            imageNumber = nil
+            shouldReply = false
+            isAnonymous = true
+        }
+        let placementId = control.placementId ?? nextKittyPlacementId()
+        var pixelOffsetX = reqOffsetX
+        var pixelOffsetY = reqOffsetY
+        if (pixelOffsetX != 0 || pixelOffsetY != 0),
+           let cellSize {
+            pixelOffsetX = min(pixelOffsetX, max(0, cellSize.width - 1))
+            pixelOffsetY = min(pixelOffsetY, max(0, cellSize.height - 1))
+        }
+
+        let savedX = buffer.x
+        let savedY = buffer.y
+        // Mirror the inline path: absolute placements position the cursor at
+        // the origin first; relative (parent-anchored) placements keep it.
+        if let col = origin.col, let row = origin.row {
+            let targetRow = row - buffer.yBase
+            if targetRow >= 0 && targetRow < buffer.lines.count {
+                buffer.y = targetRow
+                buffer.x = max(0, min(col, cols - 1))
+            } else {
+                reject("EINVAL: placement out of range")
+                return
+            }
+        }
+        let placementCol = buffer.x
+        let placementRow = buffer.y + buffer.yBase
+        // Pairs with placementRow: together they form the stable absolute
+        // coordinate used to anchor deferred stripes after scroll/trim.
+        let originLinesTop = buffer.linesTop
+        if isAnonymous {
+            evictExcessAnonymousPlacements()
+        }
+        removeKittyPlacement(imageId: imageId, placementId: placementId)
+        registerKittyPlacement(imageId: imageId,
+                               placementId: placementId,
+                               parentImageId: control.parentImageId,
+                               parentPlacementId: control.parentPlacementId,
+                               parentOffsetH: control.offsetH,
+                               parentOffsetV: control.offsetV,
+                               pixelOffsetX: pixelOffsetX,
+                               pixelOffsetY: pixelOffsetY,
+                               col: placementCol,
+                               row: placementRow,
+                               cols: cols,
+                               rows: rows,
+                               zIndex: control.zIndex,
+                               isVirtual: isVirtual)
+        if isAnonymous {
+            kittyGraphicsState.anonymousPlacementKeys.append(KittyPlacementKey(imageId: imageId, placementId: placementId))
+        }
+        if !isVirtual {
+            var didScroll = false
+            for _ in 0..<rows {
+                let placeholder = KittyHeadlessPlacementImage()
+                placeholder.kittyImageId = imageId
+                placeholder.kittyImageNumber = imageNumber
+                placeholder.kittyPlacementId = placementId
+                placeholder.kittyZIndex = control.zIndex
+                placeholder.kittyCol = placementCol
+                placeholder.kittyRow = placementRow
+                placeholder.kittyCols = cols
+                placeholder.kittyRows = rows
+                placeholder.kittyPixelOffsetX = pixelOffsetX
+                placeholder.kittyPixelOffsetY = pixelOffsetY
+                placeholder.col = placementCol
+                buffer.attachImage(placeholder, toLineAt: buffer.y + buffer.yBase)
+                updateRange(buffer.y)
+                let rowX = buffer.x
+                let previousYBase = buffer.yBase
+                let previousLinesTop = buffer.linesTop
+                cmdLineFeed()
+                if buffer.yBase != previousYBase || buffer.linesTop != previousLinesTop {
+                    didScroll = true
+                }
+                buffer.x = rowX
+            }
+            if didScroll {
+                updateFullScreen()
+            }
+            // Inline cursor semantics exactly: relative placements and
+            // cursorPolicy 1 preserve position, otherwise INDEX-scroll when
+            // headless (no cell size) or direct-set when view-backed.
+            if origin.isRelative || control.cursorPolicy == 1 {
+                buffer.x = savedX
+                buffer.y = savedY
+            } else if let grid {
+                let moveCols = max(1, grid.cols)
+                let moveRows = max(1, grid.rows)
+                let useIndex = cellSize == nil
+                applyKittyCursorMovement(startCol: placementCol,
+                                         startRow: placementRow,
+                                         cols: moveCols,
+                                         rows: moveRows,
+                                         useIndex: useIndex)
+            }
+        }
+        pendingHostedKittyRenders.append(HostedKittyRenderRequest(epoch: hostedGraphicsEpoch,
+                                                                  originLinesTop: originLinesTop,
+                                                                  imageId: imageId,
+                                                                  imageNumber: imageNumber,
+                                                                  placementId: placementId,
+                                                                  columns: cols,
+                                                                  rows: rows,
+                                                                  zIndex: control.zIndex,
+                                                                  pixelOffsetX: pixelOffsetX,
+                                                                  pixelOffsetY: pixelOffsetY,
+                                                                  format: control.format,
+                                                                  rawWidth: control.width,
+                                                                  rawHeight: control.height,
+                                                                  compression: control.compression,
+                                                                  base64Payload: base64Payload,
+                                                                  isAlternateBuffer: isCurrentBufferAlternate,
+                                                                  cellWidthPx: cellSize?.width,
+                                                                  cellHeightPx: cellSize?.height,
+                                                                  anchorCol: placementCol,
+                                                                  anchorRow: placementRow,
+                                                                  isVirtual: isVirtual,
+                                                                  isAnonymous: isAnonymous,
+                                                                  cropX: control.cropX,
+                                                                  cropY: control.cropY,
+                                                                  cropWidth: control.cropWidth,
+                                                                  cropHeight: control.cropHeight,
+                                                                  parentImageId: control.parentImageId,
+                                                                  parentPlacementId: control.parentPlacementId,
+                                                                  parentOffsetH: control.offsetH,
+                                                                  parentOffsetV: control.offsetV))
+        // Matches the inline reply: the requested placement id (which may be
+        // absent), never the auto-assigned one.
+        if shouldReply {
+            sendKittyOk(control: control, imageId: isAnonymous ? nil : imageId, imageNumber: imageNumber, placementId: control.placementId)
+        }
+    }
+
+    /// Placement grid math mirroring `kittyPlacementGridSize` for explicit
+    /// and auto (aspect-preserving) size requests, without touching payloads.
+    /// Percent requests cannot arise from the parser and return nil. All
+    /// arithmetic runs in the Double domain with exact `Int` conversion, so
+    /// untrusted control ints can never trap near `Int.max`; absurd results
+    /// simply miss and the caller rejects them.
+    private func hostedPlacementGrid(imageWidth: Int, imageHeight: Int,
+                                     columns: Int, rows: Int,
+                                     cellSize: (width: Int, height: Int)?,
+                                     pixelOffsetX: Int, pixelOffsetY: Int) -> (cols: Int, rows: Int)? {
+        if columns > 0, rows > 0 {
+            return (max(1, columns), max(1, rows))
+        }
+        guard imageWidth > 0, imageHeight > 0,
+              let cellSize, cellSize.width > 0, cellSize.height > 0,
+              pixelOffsetX >= 0, pixelOffsetY >= 0 else {
+            return nil
+        }
+        let preserveAspectRatio = columns == 0 || rows == 0
+        let aspect = Double(imageWidth) / Double(imageHeight)
+        var widthPx: Double
+        var heightPx: Double
+        if columns > 0 {
+            widthPx = Double(columns) * Double(cellSize.width)
+        } else {
+            widthPx = Double(imageWidth)
+        }
+        if rows > 0 {
+            heightPx = Double(rows) * Double(cellSize.height)
+        } else {
+            heightPx = Double(imageHeight)
+        }
+        if preserveAspectRatio {
+            if columns == 0, rows > 0 {
+                widthPx = heightPx * aspect
+            } else if rows == 0, columns > 0 {
+                heightPx = widthPx / aspect
+            }
+        }
+        guard widthPx.isFinite, heightPx.isFinite else { return nil }
+        guard let cols = Int(exactly: ceil((widthPx + Double(pixelOffsetX)) / Double(cellSize.width))),
+              let rowsOut = Int(exactly: ceil((heightPx + Double(pixelOffsetY)) / Double(cellSize.height))),
+              cols > 0, rowsOut > 0 else {
+            return nil
+        }
+        return (cols, rowsOut)
+    }
+
+    /// Evicts the oldest anonymous placements past the configured bound.
+    /// Runs after admission and before registration, so an admitted display
+    /// always fits while total anonymous state stays bounded. Stale keys
+    /// (explicit deletes, resets) are pruned first.
+    private func evictExcessAnonymousPlacements() {
+        let cap = max(1, hostedKittyLimits().maxAnonymousPlacements)
+        kittyGraphicsState.anonymousPlacementKeys.removeAll { kittyGraphicsState.placementsByKey[$0] == nil }
+        while kittyGraphicsState.anonymousPlacementKeys.count >= cap {
+            let oldest = kittyGraphicsState.anonymousPlacementKeys.removeFirst()
+            removeKittyPlacement(imageId: oldest.imageId, placementId: oldest.placementId)
+        }
+    }
+
+    /// Bounded PNG dimension prefix for auto-sized deferred displays. Decodes
+    /// only enough base64 to cover the 8-byte signature plus the IHDR length,
+    /// type, and dimensions (24 bytes from at most 64 base64 chars): no full
+    /// payload decode and no ImageIO on the feeding thread. Full header and
+    /// raster validation stays in off-main preparation, which rejects
+    /// anything this prefix misreads.
+    func hostedSniffPNGDimensions(base64Payload: [UInt8]) -> (width: Int, height: Int)? {
+        // 24 decoded bytes need 32 base64 chars without whitespace; allow a
+        // wider window so wrapped payloads still parse.
+        guard base64Payload.count >= 32 else { return nil }
+        guard let decoded = Data(base64Encoded: Data(base64Payload.prefix(64)), options: .ignoreUnknownCharacters),
+              decoded.count >= 24 else {
+            return nil
+        }
+        let pngSignature: [UInt8] = [137, 80, 78, 71, 13, 10, 26, 10]
+        guard Array(decoded.prefix(8)) == pngSignature else { return nil }
+        // IHDR chunk length must be 13 and chunk type "IHDR".
+        let chunkLength = (UInt32(decoded[8]) << 24) | (UInt32(decoded[9]) << 16) |
+            (UInt32(decoded[10]) << 8) | UInt32(decoded[11])
+        guard chunkLength == 13,
+              decoded[12] == 73, decoded[13] == 72, decoded[14] == 68, decoded[15] == 82 else {
+            return nil
+        }
+        let width = (UInt32(decoded[16]) << 24) | (UInt32(decoded[17]) << 16) |
+            (UInt32(decoded[18]) << 8) | UInt32(decoded[19])
+        let height = (UInt32(decoded[20]) << 24) | (UInt32(decoded[21]) << 16) |
+            (UInt32(decoded[22]) << 8) | UInt32(decoded[23])
+        // Exact conversion: absurd dimensions miss instead of trapping, and
+        // the grid caps reject them downstream.
+        guard width > 0, height > 0,
+              let w = Int(exactly: width), let h = Int(exactly: height) else {
+            return nil
+        }
+        return (w, h)
+    }
+
     func clearAllKittyImages() {
+        // Retire every outstanding two-phase ticket: placements recorded by
+        // the deferred parser no longer exist after a mass clear.
+        hostedGraphicsEpoch &+= 1
+        pendingHostedKittyRenders.removeAll()
+        kittyGraphicsState.renderedStripeBytesByKey.removeAll()
+        kittyGraphicsState.totalRenderedStripeBytes = 0
+        kittyGraphicsState.anonymousPlacementKeys.removeAll()
         for idx in 0..<buffer.lines.count {
             buffer.clearImagesFromLine(at: idx)
         }
@@ -1905,8 +2422,12 @@ extension Terminal {
     }
 
     private func deletePlacementsAtCell(col: Int, row: Int, zIndex: Int?) {
+        // Checked indices: untrusted 1-based positions must never trap.
+        // An overflowing row matches nothing (fail-closed).
+        guard col >= 1, row >= 1 else { return }
         let colIndex = col - 1
-        let rowIndex = row - 1 + buffer.yBase
+        let (base, overflow) = (row - 1).addingReportingOverflow(buffer.yBase)
+        let rowIndex = overflow ? Int.max : base
         let predicate: (KittyPlacementImage) -> Bool = { image in
             guard image.kittyIsKitty else { return false }
             if let zIndex = zIndex, image.kittyZIndex != zIndex {
@@ -1928,6 +2449,7 @@ extension Terminal {
     }
 
     private func deletePlacementsInColumn(_ col: Int) {
+        guard col >= 1 else { return }
         let colIndex = col - 1
         let predicate: (KittyPlacementImage) -> Bool = { image in
             self.kittyPlacementIntersectsColumn(image, col: colIndex)
@@ -1943,7 +2465,9 @@ extension Terminal {
     }
 
     private func deletePlacementsInRow(_ row: Int) {
-        let rowIndex = row - 1 + buffer.yBase
+        guard row >= 1 else { return }
+        let (base, overflow) = (row - 1).addingReportingOverflow(buffer.yBase)
+        let rowIndex = overflow ? Int.max : base
         let predicate: (KittyPlacementImage) -> Bool = { image in
             self.kittyPlacementIntersectsRow(image, row: rowIndex)
         }
@@ -2031,7 +2555,11 @@ extension Terminal {
         }
         let removedKeys = removeKittyPlacements(in: normalBuffer, lineRange: 0..<normalBuffer.lines.count, predicate: predicate)
         let altRemoved = removeKittyPlacements(in: altBuffer, lineRange: 0..<altBuffer.lines.count, predicate: predicate)
-        return removedKeys.union(altRemoved)
+        let combined = removedKeys.union(altRemoved)
+        // Line stripes are freed even when the record survives; release the
+        // retained-stripe cost so accounting tracks actual bitmaps.
+        releaseRenderedStripeCost(keys: combined)
+        return combined
     }
 
     private func removePlacementRecords(_ predicate: (KittyPlacementRecord) -> Bool) -> Set<KittyPlacementKey> {
@@ -2042,6 +2570,7 @@ extension Terminal {
         for key in removed {
             kittyGraphicsState.placementsByKey.removeValue(forKey: key)
         }
+        releaseRenderedStripeCost(keys: removed)
         return removed
     }
 
@@ -2083,7 +2612,7 @@ extension Terminal {
         return right >= screenLeft && left <= screenRight && bottom >= screenTop && top <= screenBottom
     }
 
-    private func cleanupUnusedKittyImages() {
+    func cleanupUnusedKittyImages() {
         let used = collectUsedKittyImageIds()
         let unusedIds = kittyGraphicsState.imagesById.keys.filter { !used.contains($0) }
         for id in unusedIds {
@@ -2091,7 +2620,15 @@ extension Terminal {
         }
     }
 
-    private func storeKittyImage(payload: KittyGraphicsPayload, imageId: UInt32, imageNumber: UInt32?) {
+    func storeKittyImage(payload: KittyGraphicsPayload, imageId: UInt32, imageNumber: UInt32?) {
+        setKittyImagePayloadStaged(payload: payload, imageId: imageId, imageNumber: imageNumber)
+        enforceKittyImageCacheLimit()
+    }
+
+    /// Stores one image payload without cache enforcement. The two-phase
+    /// install commits every staged payload first and enforces once, so a
+    /// prevalidated atomic batch cannot evict itself mid-commit.
+    func setKittyImagePayloadStaged(payload: KittyGraphicsPayload, imageId: UInt32, imageNumber: UInt32?) {
         let byteSize = kittyPayloadByteSize(payload)
         let lastAccessTick = nextKittyImageAccessTick()
         if let existing = kittyGraphicsState.imagesById[imageId] {
@@ -2104,7 +2641,6 @@ extension Terminal {
         if let number = imageNumber {
             kittyGraphicsState.imageNumbers[number] = imageId
         }
-        enforceKittyImageCacheLimit()
     }
 
     private func updateKittyImageAccess(imageId: UInt32) -> KittyGraphicsImage? {
@@ -2116,7 +2652,7 @@ extension Terminal {
         return image
     }
 
-    private func kittyPayloadByteSize(_ payload: KittyGraphicsPayload) -> Int {
+    func kittyPayloadByteSize(_ payload: KittyGraphicsPayload) -> Int {
         switch payload {
         case .png(let data):
             return data.count
@@ -2125,13 +2661,13 @@ extension Terminal {
         }
     }
 
-    private func nextKittyImageAccessTick() -> UInt64 {
+    func nextKittyImageAccessTick() -> UInt64 {
         let tick = kittyGraphicsState.nextImageAccessTick
         kittyGraphicsState.nextImageAccessTick &+= 1
         return tick
     }
 
-    private func enforceKittyImageCacheLimit() {
+    func enforceKittyImageCacheLimit() {
         let limit = clampedKittyImageCacheLimitBytes()
         guard kittyGraphicsState.totalImageBytes > limit else {
             return
@@ -2160,7 +2696,7 @@ extension Terminal {
         }
     }
 
-    private func clampedKittyImageCacheLimitBytes() -> Int {
+    func clampedKittyImageCacheLimitBytes() -> Int {
         let configured = options.kittyImageCacheLimitBytes
         if configured <= 0 {
             return 0
@@ -2176,7 +2712,7 @@ extension Terminal {
         removeKittyImageNumbers(for: imageId)
     }
 
-    private func removeKittyImageNumbers(for imageId: UInt32) {
+    func removeKittyImageNumbers(for imageId: UInt32) {
         let numbers = kittyGraphicsState.imageNumbers.filter { $0.value == imageId }.map { $0.key }
         for number in numbers {
             kittyGraphicsState.imageNumbers.removeValue(forKey: number)
@@ -2229,64 +2765,11 @@ extension Terminal {
         return col >= left && col <= right
     }
 
-    private func decompressZlib(_ data: Data) -> Data? {
-#if canImport(Compression)
-        let dummyDst = UnsafeMutablePointer<UInt8>.allocate(capacity: 1)
-        let dummySrc = UnsafeMutablePointer<UInt8>.allocate(capacity: 1)
-        var stream = compression_stream(dst_ptr: dummyDst,
-                                        dst_size: 0,
-                                        src_ptr: UnsafePointer(dummySrc),
-                                        src_size: 0,
-                                        state: nil)
-        let status = compression_stream_init(&stream, COMPRESSION_STREAM_DECODE, COMPRESSION_ZLIB)
-        guard status != COMPRESSION_STATUS_ERROR else {
-            dummyDst.deallocate()
-            dummySrc.deallocate()
-            return nil
-        }
-        defer {
-            compression_stream_destroy(&stream)
-            dummyDst.deallocate()
-            dummySrc.deallocate()
-        }
-
-        var output = Data()
-        let dstSize = 64 * 1024
-        var dstBuffer = [UInt8](repeating: 0, count: dstSize)
-
-        return data.withUnsafeBytes { srcPtr -> Data? in
-            guard let srcBase = srcPtr.bindMemory(to: UInt8.self).baseAddress else {
-                return nil
-            }
-            stream.src_ptr = srcBase
-            stream.src_size = data.count
-
-            while true {
-                let status = dstBuffer.withUnsafeMutableBytes { dstPtr -> compression_status in
-                    guard let dstBase = dstPtr.bindMemory(to: UInt8.self).baseAddress else {
-                        return COMPRESSION_STATUS_ERROR
-                    }
-                    stream.dst_ptr = dstBase
-                    stream.dst_size = dstSize
-                    return compression_stream_process(&stream, 0)
-                }
-                let produced = dstSize - stream.dst_size
-                if produced > 0 {
-                    output.append(dstBuffer, count: produced)
-                }
-
-                switch status {
-                case COMPRESSION_STATUS_END:
-                    return output
-                case COMPRESSION_STATUS_OK:
-                    continue
-                default:
-                    return nil
-                }
-            }
-        }
-#else
-        return nil
-#endif
+    /// zlib inflate with an in-loop output cap. The default preserves the
+    /// legacy bound; pass a smaller cap to enforce admission while appending.
+    /// Shares the pure-Swift RFC1950 decoder with the two-phase prepare path
+    /// so `o=z` behaves identically on every platform.
+    private func decompressZlib(_ data: Data, maxOutputBytes: Int = Terminal.kittyMaxImageBytes) -> Data? {
+        HostedKittyImageDecoder.decompressZlib(data, maxOutputBytes: maxOutputBytes)
     }
 }

@@ -1,7 +1,7 @@
 import Testing
 @testable import SwiftTerm
 
-final class TerminalTestDelegate: TerminalDelegate {
+class TerminalTestDelegate: TerminalDelegate {
     private(set) var sentData: [[UInt8]] = []
     var cellSizeInPixelsValue: (width: Int, height: Int)? = nil
 
@@ -26,6 +26,12 @@ final class TerminalTestDelegate: TerminalDelegate {
 
     func cellSizeInPixels(source: Terminal) -> (width: Int, height: Int)? {
         return cellSizeInPixelsValue
+    }
+
+    // Explicitly implemented (rather than relying on the protocol default)
+    // so subclasses can override stripe-attach behavior for install tests.
+    func attachPreparedKittyImage(source: Terminal, prepared: HostedKittyPreparedImage) -> Bool {
+        return true
     }
 }
 

@@ -189,6 +189,11 @@ Key options:
 | `screenReaderMode` | `false` | Accessibility mode |
 | `enableSixelReported` | `true` | Advertise Sixel support to applications |
 | `kittyImageCacheLimitBytes` | 320 MB | Memory limit for Kitty image cache |
+| `kittyHostedPayloadLimitBytes` | 8 MB | Per-payload cap for two-phase hosted Kitty decode |
+| `kittyHostedMaxPartialEncodedBytes` | 12 MB | Chunked (`m=1`) transfer accumulation cap while two-phase rendering is on |
+| `kittyHostedMaxPendingJobs` | 32 | Completed two-phase ticket queue depth cap |
+| `kittyHostedMaxPendingBytes` | 64 MB | Completed two-phase ticket byte cap |
+| `hostedKittyTwoPhaseRendering` | `false` | Defer Kitty decode to `prepareHostedKittyRender` |
 | `ansi256PaletteStrategy` | `.base16Lab` | 256-color palette generation strategy |
 
 The `.base16Lab` and `.base16LabHarmonious` strategies are based on the

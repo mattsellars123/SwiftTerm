@@ -261,6 +261,16 @@ public protocol TerminalDelegate: AnyObject {
      *  - preserveAspectRatio: if set, one of the dimensions will track the hardcoded setting set for the other.
      */
     func createImage (source: Terminal, data: Data, width: ImageSizeRequest, height: ImageSizeRequest, preserveAspectRatio: Bool)
+
+    /**
+     * Invoked to swap headless placeholder rows recorded by the two-phase
+     * hosted graphics parser for precomputed stripes from a prepared image.
+     * The prepared value already carries the fully scaled canvas sliced into
+     * per-row stripe bytes: build view objects from those bytes only. Do not
+     * PNG-decode, scale, or slice here; no stripe-generation work may run on
+     * the install (feeding) thread. See the default implementation.
+     */
+    func attachPreparedKittyImage (source: Terminal, prepared: HostedKittyPreparedImage) -> Bool
 }
 
 /// Enumeration passed to the TerminalDelegate.createImage to configure
@@ -430,6 +440,18 @@ open class Terminal {
     public var parser: EscapeSequenceParser
     var kittyGraphicsState = KittyGraphicsState()
     var kittyPlacementContext: KittyPlacementContext?
+    /// Fencing epoch for two-phase hosted Kitty graphics. Bumped whenever
+    /// image state is mass-cleared or explicitly invalidated so outstanding
+    /// decode tickets can never commit to a newer generation.
+    public internal(set) var hostedGraphicsEpoch: UInt64 = 0
+    /// FIFO queue of immutable decode tickets recorded by the parser when
+    /// `TerminalOptions.hostedKittyTwoPhaseRendering` is enabled.
+    var pendingHostedKittyRenders: [HostedKittyRenderRequest] = []
+    /// Feeding-thread identity for two-phase hosted graphics, recorded by
+    /// the first debug-checked entry point. Debug-only confinement check:
+    /// every hosted parse/admit/drain/install call must run on the same
+    /// thread that feeds the terminal. Never consulted in release builds.
+    var hostedFeedingThread: Thread?
     
     var refreshStart = Int.max
     var refreshEnd = -1
@@ -6845,5 +6867,29 @@ public extension TerminalDelegate {
     }
 
     func createImage (source: Terminal, data: Data, width: ImageSizeRequest, height: ImageSizeRequest, preserveAspectRatio: Bool) {
-    }    
+    }
+
+    /**
+     * Invoked to swap headless placeholder rows recorded by the two-phase
+     * hosted graphics parser for precomputed stripes from a prepared image.
+     *
+     * Called synchronously from `Terminal.installHostedKittyPreparedImages`
+     * on the feeding thread after the batch passed epoch, placement, and
+     * source-plus-rendered cache validation. The default implementation does
+     * nothing and reports success, which keeps headless terminals
+     * authoritative through their placeholder rows. View-backed terminals
+     * override this to build image objects from `prepared.stripes` and
+     * remove the placeholders they replace. Only view-object creation,
+     * placeholder validation, and attachment belong here: never PNG-decode,
+     * scale, or slice stripes on this path.
+     * - Parameters:
+     *  - source: identifies the instance of the terminal that sent this request
+     *  - prepared: validated source raster plus precomputed stripe bytes
+     * - Returns: true when the placeholder swap completed; false triggers a
+     *   full batch rollback (committed payloads restored, attached stripes
+     *   removed, placeholders rebuilt), so a later install can retry.
+     */
+    func attachPreparedKittyImage (source: Terminal, prepared: HostedKittyPreparedImage) -> Bool {
+        return true
+    }
 }

@@ -335,6 +335,10 @@ public class EscapeSequenceParser {
     // buffers over several calls
     var _osc: cstring
     var _apc: cstring
+    /// Set once a hosted Kitty APC exceeds its configured encoded cap: the
+    /// parser drops further bytes until the terminator instead of retaining
+    /// them, across feed calls. Reset on every new sequence and abort.
+    var _apcOverflow = false
     var _pars: [Int]
     var _parsTxt: [UInt8]
     var _collect: cstring
@@ -559,6 +563,14 @@ public class EscapeSequenceParser {
         }
     }
 
+    /// Terminal for a hosted Kitty APC that exceeded its configured encoded
+    /// cap while accumulating: the tail was dropped pre-parse, so this emits
+    /// the single typed overflow instead of dispatching truncated bytes.
+    func dispatchHostedApcOverflow(content: ArraySlice<UInt8>) {
+        guard let terminal = terminal else { return }
+        terminal.rejectHostedApcOverflow(contentPrefix: content)
+    }
+
     func dispatchDcs(collect: cstring, code: UInt8, pars: [Int]) -> DcsHandler? {
         guard let terminal = terminal else { return nil }
 
@@ -595,6 +607,7 @@ public class EscapeSequenceParser {
         currentState = initialState
         _osc = []
         _apc = []
+        _apcOverflow = false
         _pars = [0]
         _collect = []
         activeDcsHandler = nil
@@ -642,7 +655,15 @@ public class EscapeSequenceParser {
         var parsTxt = self._parsTxt
         let tableData = table.table
         var dcsHandler = activeDcsHandler
-        
+
+        // Hosted Kitty APC bound, resolved once per feed: nil unless
+        // two-phase mode is enabled, so flag-off parsers accumulate exactly
+        // as before. Needs no API change: the parser already holds the
+        // terminal and reads its configured limits.
+        var hostedApcCap: Int? = nil
+        if let parserTerminal = self.terminal, parserTerminal.options.hostedKittyTwoPhaseRendering {
+            hostedApcCap = parserTerminal.hostedKittyLimits().maxPartialEncodedBytes
+        }
         //dump (data)
             
         // process input string
@@ -762,6 +783,7 @@ public class EscapeSequenceParser {
                 }
                 osc = []
                 apc = []
+                self._apcOverflow = false
                 pars = [0]
                 parsTxt = []
                 collect = []
@@ -803,6 +825,9 @@ public class EscapeSequenceParser {
                 } else {
                     osc = []
                 }
+                // A new sequence starts: prior overflow state never leaks
+                // into it.
+                self._apcOverflow = false
             case .oscPut:
                 var j = i
                 while j < end {
@@ -811,7 +836,20 @@ public class EscapeSequenceParser {
                         break
                     } else if c >= 0x20 {
                         if currentState == .apcString {
-                            apc.append (c)
+                            // Hosted Kitty cap: once a G APC exceeds its
+                            // configured encoded bound, drop bytes until the
+                            // terminator instead of retaining them, across
+                            // feed calls. Flag-off and non-Kitty APCs
+                            // accumulate unchanged.
+                            if let cap = hostedApcCap, apc.first == 0x47 {
+                                if apc.count - 1 < cap {
+                                    apc.append (c)
+                                } else {
+                                    self._apcOverflow = true
+                                }
+                            } else {
+                                apc.append (c)
+                            }
                         } else {
                             osc.append (c)
                         }
@@ -821,7 +859,16 @@ public class EscapeSequenceParser {
                 i = j - 1
             case .oscEnd:
                 if currentState == .apcString {
-                    if apc.count != 0 && code != ControlCodes.CAN && code != ControlCodes.SUB {
+                    if self._apcOverflow {
+                        // Over-cap Kitty APC: one typed overflow for the
+                        // dropped tail, never a dispatch of truncated bytes.
+                        // Aborts (CAN/SUB) stay silent like normal sequences.
+                        self._apcOverflow = false
+                        if code != ControlCodes.CAN && code != ControlCodes.SUB {
+                            let content = apc.count > 1 ? apc[(apc.startIndex+1)...] : ArraySlice<UInt8>()
+                            dispatchHostedApcOverflow(content: content)
+                        }
+                    } else if apc.count != 0 && code != ControlCodes.CAN && code != ControlCodes.SUB {
                         let command = apc[apc.startIndex]
                         let content = apc.count > 1 ? apc[(apc.startIndex+1)...] : ArraySlice<UInt8>()
                         dispatchApc(command: command, content: content)

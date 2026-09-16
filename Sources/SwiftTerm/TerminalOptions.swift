@@ -72,6 +72,25 @@ public struct TerminalOptions {
     public var enableSixelReported:Bool
     /// Maximum total bytes to keep for kitty image data; defaults to 320MB and is clamped to 4GB.
     public var kittyImageCacheLimitBytes: Int
+    /// Maximum accepted size of one two-phase hosted Kitty payload, in bytes;
+    /// defaults to 8MB. Only consulted by the hosted transaction API.
+    public var kittyHostedPayloadLimitBytes: Int
+    /// Maximum base64 bytes accumulated for one chunked (`m=1`) hosted Kitty
+    /// transfer before the parser drops it with a typed overload error.
+    /// Defaults to 12MB (8MB payload at 4/3 base64 expansion plus margin).
+    /// Only enforced while `hostedKittyTwoPhaseRendering` is enabled.
+    public var kittyHostedMaxPartialEncodedBytes: Int
+    /// Maximum completed two-phase decode tickets queued inside the terminal.
+    /// Only enforced while `hostedKittyTwoPhaseRendering` is enabled.
+    public var kittyHostedMaxPendingJobs: Int
+    /// Maximum total base64 bytes held by completed two-phase decode tickets.
+    /// Only enforced while `hostedKittyTwoPhaseRendering` is enabled.
+    public var kittyHostedMaxPendingBytes: Int
+    /// Opts the terminal into two-phase hosted Kitty rendering: transmit-and-
+    /// display sequences with direct payloads record cursor-anchored placements
+    /// and enqueue immutable decode tickets instead of decoding inline.
+    /// Defaults to false; the legacy inline path is unchanged.
+    public var hostedKittyTwoPhaseRendering: Bool
     /// Strategy used to derive the 256-color palette from the base 16 colors.
     public var ansi256PaletteStrategy: Ansi256PaletteStrategy
     /// Width for individual Regional Indicator symbols. `.wide` (default) preserves existing
@@ -89,11 +108,16 @@ public struct TerminalOptions {
                                                        tabStopWidth: 8,
                                                        enableSixelReported: true,
                                                        kittyImageCacheLimitBytes: 320 * 1024 * 1024,
+                                                       kittyHostedPayloadLimitBytes: 8 * 1024 * 1024,
+                                                       kittyHostedMaxPartialEncodedBytes: 12 * 1024 * 1024,
+                                                       kittyHostedMaxPendingJobs: 32,
+                                                       kittyHostedMaxPendingBytes: 64 * 1024 * 1024,
+                                                       hostedKittyTwoPhaseRendering: false,
                                                        ansi256PaletteStrategy: .base16Lab,
                                                        regionalIndicatorWidth: .wide)
 
   public init(cols: Int = Self.default.cols, rows: Int = Self.default.rows, convertEol: Bool = Self.default.convertEol, termName: String = Self.default.termName, cursorStyle: CursorStyle = Self.default.cursorStyle, screenReaderMode: Bool = Self.default.screenReaderMode, scrollback: Int = Self.default.scrollback, tabStopWidth: Int = Self.default.tabStopWidth,
-              enableSixelReported: Bool = Self.default.enableSixelReported, kittyImageCacheLimitBytes: Int = Self.default.kittyImageCacheLimitBytes, ansi256PaletteStrategy: Ansi256PaletteStrategy = Self.default.ansi256PaletteStrategy,
+              enableSixelReported: Bool = Self.default.enableSixelReported, kittyImageCacheLimitBytes: Int = Self.default.kittyImageCacheLimitBytes, kittyHostedPayloadLimitBytes: Int = Self.default.kittyHostedPayloadLimitBytes, kittyHostedMaxPartialEncodedBytes: Int = Self.default.kittyHostedMaxPartialEncodedBytes, kittyHostedMaxPendingJobs: Int = Self.default.kittyHostedMaxPendingJobs, kittyHostedMaxPendingBytes: Int = Self.default.kittyHostedMaxPendingBytes, hostedKittyTwoPhaseRendering: Bool = Self.default.hostedKittyTwoPhaseRendering, ansi256PaletteStrategy: Ansi256PaletteStrategy = Self.default.ansi256PaletteStrategy,
               regionalIndicatorWidth: RegionalIndicatorWidth = Self.default.regionalIndicatorWidth) {
         self.cols = cols
         self.rows = rows
@@ -105,6 +129,11 @@ public struct TerminalOptions {
         self.tabStopWidth = tabStopWidth
         self.enableSixelReported = enableSixelReported
         self.kittyImageCacheLimitBytes = kittyImageCacheLimitBytes
+        self.kittyHostedPayloadLimitBytes = kittyHostedPayloadLimitBytes
+        self.kittyHostedMaxPartialEncodedBytes = kittyHostedMaxPartialEncodedBytes
+        self.kittyHostedMaxPendingJobs = kittyHostedMaxPendingJobs
+        self.kittyHostedMaxPendingBytes = kittyHostedMaxPendingBytes
+        self.hostedKittyTwoPhaseRendering = hostedKittyTwoPhaseRendering
         self.ansi256PaletteStrategy = ansi256PaletteStrategy
         self.regionalIndicatorWidth = regionalIndicatorWidth
     }
