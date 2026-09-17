@@ -336,6 +336,23 @@ final class KittyGraphicsLifecycleTests {
         #expect(t.kittyGraphicsState.imagesById[1] != nil)
     }
 
+    /// Pi sends only `m=` on continuation chunks, so hosted mode must use
+    /// the direct-transmit controls retained from the opening chunk.
+    @Test func testHostedChunkedDirectTransmissionInheritsOpeningControls() {
+        let harness = TerminalTestHarness.makeTerminal()
+        let terminal = harness.terminal
+        terminal.options.hostedKittyTwoPhaseRendering = true
+
+        let firstChunk = Data([1, 2, 3]).base64EncodedString()
+        terminal.feed(text: "\u{1b}_Ga=T,f=24,s=2,v=1,c=1,r=1,i=1,q=2,m=1;\(firstChunk)\u{1b}\\")
+
+        let finalChunk = Data([4, 5, 6]).base64EncodedString()
+        terminal.feed(text: "\u{1b}_Gm=0;\(finalChunk)\u{1b}\\")
+
+        #expect(terminal.takePendingHostedKittyRenders().count == 1)
+        #expect(harness.delegate.sentData.isEmpty)
+    }
+
     /// Test quiet mode suppresses response (q=1)
     /// From Ghostty: "kittygfx more chunks with q=1"
     @Test func testQuietModeSuppressesResponse() {

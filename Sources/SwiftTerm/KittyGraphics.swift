@@ -266,7 +266,13 @@ extension Terminal {
         // or placement state changes, so a rejection retains zero bytes,
         // jobs, or state. Flag-off behavior is unchanged below.
         if options.hostedKittyTwoPhaseRendering {
-            guard control.action == "T", control.transmission == "d" else {
+            // Kitty continuation chunks normally contain only `m=`. They
+            // inherit their action and transmission from the opening chunk,
+            // which is retained in `pending` until the final chunk arrives.
+            // Validate that effective control rather than rejecting a valid
+            // direct transmission as the default `a=t` continuation.
+            let effectiveControl = kittyGraphicsState.pending?.control ?? control
+            guard effectiveControl.action == "T", effectiveControl.transmission == "d" else {
                 sendStrictHostedRejection(control: control)
                 return
             }
