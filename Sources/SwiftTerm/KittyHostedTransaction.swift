@@ -298,6 +298,17 @@ public struct HostedKittyPreparedImage: Sendable, Equatable {
     /// Total stripe bytes (`scaledWidth * scaledHeight * 4` when stripes are
     /// present). Pre-admitted at install and tracked with stripe lifecycle.
     public var renderedByteCost: Int
+    /// Batch-budget source charge for this image's `rgba` bytes. Single
+    /// prepares and the first placement of a verified shared-source group
+    /// charge the full cropped raster (`rgba.count`); later placements whose
+    /// ticket fingerprint and crop rectangle match an earlier group alias the
+    /// same `Data` storage and charge zero. Rendered stripes are always
+    /// per-placement in `renderedByteCost`. PiSesh metrics should sum
+    /// `sourceChargeBytes` (unique source) plus `renderedByteCost`
+    /// (per-placement render), for example via
+    /// `hostedPreparedBatchChargedBytes`, instead of summing `rgba.count`
+    /// per placement, which overcharges shared sources.
+    public var sourceChargeBytes: Int
     public var isVirtual: Bool
     public var isAnonymous: Bool
     public var parentImageId: UInt32?
@@ -327,6 +338,7 @@ public struct HostedKittyPreparedImage: Sendable, Equatable {
                 anchorCol: Int = 0,
                 anchorRow: Int = 0,
                 renderedByteCost: Int = 0,
+                sourceChargeBytes: Int? = nil,
                 isVirtual: Bool = false,
                 isAnonymous: Bool = false,
                 parentImageId: UInt32? = nil,
@@ -355,6 +367,7 @@ public struct HostedKittyPreparedImage: Sendable, Equatable {
         self.anchorCol = anchorCol
         self.anchorRow = anchorRow
         self.renderedByteCost = renderedByteCost
+        self.sourceChargeBytes = sourceChargeBytes ?? rgba.count
         self.isVirtual = isVirtual
         self.isAnonymous = isAnonymous
         self.parentImageId = parentImageId
@@ -739,19 +752,33 @@ private func finishHostedPrepare(request: HostedKittyRenderRequest,
 /// and reused across placements whose payload bytes, format, raw
 /// dimensions, and compression all match. A byte mismatch under a repeated
 /// image id disables reuse for that ticket (which prepares independently),
-/// so hand-built batches can never Alias one image's raster onto another.
-/// Per-placement crops, scales, and stripes are always computed
-/// independently, since placement geometry may differ.
+/// so hand-built batches can never alias one image's raster onto another.
+/// Per-placement scales and stripes are always computed independently,
+/// since placement geometry may differ.
+///
+/// Batch memory admission charges verified shared source bytes once per
+/// unique source identity (image id plus exact source fingerprint plus crop
+/// rectangle) while every placement still charges its own
+/// `renderedByteCost`. Placements that verify byte-identical against an
+/// already-charged group alias that group's shared `Data` storage and carry
+/// `sourceChargeBytes == 0`; a same-id byte mismatch or a genuinely
+/// distinct crop never aliases and retains its own full source charge.
+/// PiSesh metrics should report `hostedPreparedBatchUniqueSourceBytes` plus
+/// `hostedPreparedBatchRenderedBytes` (or `hostedPreparedBatchChargedBytes`)
+/// instead of summing `rgba.count` per placement.
 public func prepareHostedKittyBatch(_ requests: [HostedKittyRenderRequest],
                                     limits: HostedKittyGraphicsLimits = .default) -> Result<[HostedKittyPreparedImage], HostedKittyPrepareError> {
     var prepared: [HostedKittyPreparedImage] = []
     prepared.reserveCapacity(requests.count)
     var inFlight = 0
     var rasterCache: [UInt32: (fingerprint: HostedBatchFingerprint, raster: (rgba: Data, width: Int, height: Int))] = [:]
+    var chargedGroups: [(imageId: UInt32, fingerprint: HostedBatchFingerprint, cropX: Int, cropY: Int, cropWidth: Int, cropHeight: Int, rgba: Data)] = []
     for request in requests {
         let preparedResult: Result<HostedKittyPreparedImage, HostedKittyPrepareError>
+        let groupFingerprint: HostedBatchFingerprint
         if let cached = rasterCache[request.imageId],
            cached.fingerprint.matches(request: request) {
+            groupFingerprint = cached.fingerprint
             guard hostedPrepareGeometry(request: request, limits: limits) else {
                 return .failure(.badDimensions)
             }
@@ -778,14 +805,41 @@ public func prepareHostedKittyBatch(_ requests: [HostedKittyRenderRequest],
             case .failure(let error):
                 return .failure(error)
             }
-            rasterCache[request.imageId] = (HostedBatchFingerprint(request: request), raster)
+            let fingerprint = HostedBatchFingerprint(request: request)
+            rasterCache[request.imageId] = (fingerprint, raster)
+            groupFingerprint = fingerprint
             preparedResult = finishHostedPrepare(request: request, sourceRGBA: raster.rgba,
                                                  sourceWidth: raster.width, sourceHeight: raster.height,
                                                  limits: limits)
         }
         switch preparedResult {
-        case .success(let image):
-            let (itemCost, costOverflow) = image.rgba.count.addingReportingOverflow(image.renderedByteCost)
+        case .success(var image):
+            // Verified sharing: alias only when the ticket fingerprint, the
+            // crop rectangle, and the finished cropped bytes all agree with
+            // an already-charged group. Same-id byte mismatches and distinct
+            // crops fall through to their own full charge and allocation.
+            var sharedIndex: Int?
+            for (index, group) in chargedGroups.enumerated() {
+                guard group.imageId == request.imageId,
+                      group.cropX == request.cropX,
+                      group.cropY == request.cropY,
+                      group.cropWidth == request.cropWidth,
+                      group.cropHeight == request.cropHeight,
+                      group.fingerprint.matches(request: request),
+                      group.rgba == image.rgba else {
+                    continue
+                }
+                sharedIndex = index
+                break
+            }
+            if let index = sharedIndex {
+                image.rgba = chargedGroups[index].rgba
+                image.sourceChargeBytes = 0
+            } else {
+                image.sourceChargeBytes = image.rgba.count
+                chargedGroups.append((request.imageId, groupFingerprint, request.cropX, request.cropY, request.cropWidth, request.cropHeight, image.rgba))
+            }
+            let (itemCost, costOverflow) = image.sourceChargeBytes.addingReportingOverflow(image.renderedByteCost)
             let (total, totalOverflow) = inFlight.addingReportingOverflow(itemCost)
             guard !costOverflow, !totalOverflow, total <= limits.maxPreparedBatchBytes else {
                 return .failure(.exceedsBatchLimit(bytes: Int.max, limit: limits.maxPreparedBatchBytes))
@@ -797,6 +851,37 @@ public func prepareHostedKittyBatch(_ requests: [HostedKittyRenderRequest],
         }
     }
     return .success(prepared)
+}
+
+/// Unique source bytes retained by a prepared batch: the saturating sum of
+/// `sourceChargeBytes`. Verified shared-source placements contribute once;
+/// same-id byte mismatches and distinct crops each contribute their own
+/// charge. Content-free: counts only, never image bytes.
+public func hostedPreparedBatchUniqueSourceBytes(_ images: [HostedKittyPreparedImage]) -> Int {
+    var total = 0
+    for image in images {
+        total = hostedSaturatingAdd(total, max(0, image.sourceChargeBytes))
+    }
+    return total
+}
+
+/// Per-placement rendered bytes retained by a prepared batch: the saturating
+/// sum of `renderedByteCost`. Every placement charges its own stripes, even
+/// when its source bytes are shared.
+public func hostedPreparedBatchRenderedBytes(_ images: [HostedKittyPreparedImage]) -> Int {
+    var total = 0
+    for image in images {
+        total = hostedSaturatingAdd(total, max(0, image.renderedByteCost))
+    }
+    return total
+}
+
+/// Total batch-budget bytes retained by a prepared batch: unique source plus
+/// per-placement render, with saturating arithmetic that can never trap.
+/// PiSesh callers should report this (or the unique/rendered pair) instead
+/// of summing `rgba.count` per placement, which overcharges shared sources.
+public func hostedPreparedBatchChargedBytes(_ images: [HostedKittyPreparedImage]) -> Int {
+    hostedSaturatingAdd(hostedPreparedBatchUniqueSourceBytes(images), hostedPreparedBatchRenderedBytes(images))
 }
 
 /// Batch-cache identity for one ticket's source payload: the exact input
