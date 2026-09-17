@@ -120,6 +120,21 @@ oldest-first past a count cap, anonymous displays evict oldest-first,
 and reset retires everything. The flag off preserves the legacy inline
 behavior unchanged.
 
+Reconnect hydration reuses the same transaction without replaying
+terminal bytes: install the placement-only state with
+``Terminal/prepareKittyGraphicsManifest(_:)``, commit any suffix output,
+then call ``Terminal/makeHostedKittyDeferredTickets(manifest:payloads:)``
+on the feeding thread. It returns immutable ``HostedKittyRenderRequest``
+tickets only for manifest placements that still own live placeholder rows
+with matching snapshot payloads — capturing the current epoch, buffer
+identity, `linesTop`/anchors, and delegate cell geometry — so the tickets
+flow through ``prepareHostedKittyBatch`` and
+``Terminal/installHostedKittyPreparedImages`` exactly like parser-produced
+tickets. Ticket creation is strictly read-only (no cursor movement, APC
+replies, placeholder rows, or payload storage) and never resurrects
+deleted or replaced placements; it returns nil for version/structural
+invalidity and an empty array when nothing survived.
+
 ## Implementing Graphics in a Custom Front-End
 
 If you are building a custom front-end (not using the bundled AppKit/UIKit views),

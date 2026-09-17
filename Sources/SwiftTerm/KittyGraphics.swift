@@ -1936,6 +1936,158 @@ extension Terminal {
         )
     }
 
+    /// Builds deferred two-phase decode tickets for a reconnected session
+    /// from an installed manifest and its deferred payload snapshot.
+    ///
+    /// Call on the feeding thread after `prepareKittyGraphicsManifest` and
+    /// any suffix commits (replayed bytes, scrolls, deletes). For every
+    /// manifest placement that still owns live headless placeholder rows,
+    /// still has its placement record in the current buffer, has no stored
+    /// payload yet, and has a matching image in `payloads`, this returns one
+    /// immutable `HostedKittyRenderRequest` carrying the payload re-encoded
+    /// exactly as received on the wire. PNG snapshot payloads become
+    /// `f=100` tickets; RGBA snapshot payloads become `f=32` tickets with
+    /// their stored dimensions.
+    ///
+    /// Each ticket captures the current `hostedGraphicsEpoch`, buffer
+    /// identity, `buffer.linesTop`, the live first-row anchor, and the
+    /// delegate cell geometry, so the tickets flow unchanged through the
+    /// existing `prepareHostedKittyBatch` (any thread) and
+    /// `installHostedKittyPreparedImages` (feeding thread) transaction. The
+    /// anchor plus `originLinesTop` forms the stable absolute coordinate
+    /// the view uses to map surviving placeholder lines to stripe indices.
+    ///
+    /// This function is strictly read-only: it never moves the cursor,
+    /// sends APC replies, creates placeholder rows, stores payloads,
+    /// enqueues parser tickets, or resurrects deleted/replaced placements.
+    /// Removed placements (no surviving placeholder rows or record) and
+    /// replaced placements (payload already stored under the image id) are
+    /// silently omitted. No image bytes are decoded here: payload-size and
+    /// cache admission stay in `prepare`/`install`, which reject what does
+    /// not fit.
+    ///
+    /// - Returns: nil when `manifest` or `payloads` has a non-`1` version
+    ///   or is structurally invalid (empty manifest range, non-positive
+    ///   placement grid, out-of-range placement rows, duplicate payload
+    ///   ids, empty PNG data, or RGBA bytes that do not match their
+    ///   dimensions). A non-nil empty array means valid input with no
+    ///   surviving placements to hydrate.
+    public func makeHostedKittyDeferredTickets(manifest: TerminalKittyGraphicsManifest,
+                                               payloads: TerminalKittyGraphicsPayloadSnapshot) -> [HostedKittyRenderRequest]? {
+        assert(recordHostedFeedingThread())
+        // Pure structural validation first: every failure below returns
+        // before any terminal state is read or touched.
+        guard manifest.version == 1,
+              payloads.version == 1,
+              manifest.retainedLineCount > 0 else { return nil }
+        for placement in manifest.placements {
+            guard placement.columns > 0,
+                  placement.rows > 0,
+                  placement.relativeRow >= 0 else { return nil }
+            // Checked row arithmetic: hostile manifest ints must never trap.
+            let (endRow, overflow) = placement.relativeRow.addingReportingOverflow(placement.rows)
+            guard !overflow, endRow <= manifest.retainedLineCount else { return nil }
+        }
+        var payloadByID: [UInt32: TerminalKittyGraphicsSnapshot.Image] = [:]
+        payloadByID.reserveCapacity(payloads.images.count)
+        for image in payloads.images {
+            // Duplicate image ids cannot be addressed unambiguously.
+            guard payloadByID[image.id] == nil else { return nil }
+            switch image.payload {
+            case .png(let data):
+                guard !data.isEmpty else { return nil }
+            case .rgba(let data, let width, let height):
+                guard width > 0, height > 0 else { return nil }
+                let (area, areaOverflow) = width.multipliedReportingOverflow(by: height)
+                let (expected, expectedOverflow) = area.multipliedReportingOverflow(by: 4)
+                guard !areaOverflow, !expectedOverflow, data.count == expected else { return nil }
+            }
+            payloadByID[image.id] = image
+        }
+        // Candidate placements are exactly the manifest keys: anything the
+        // manifest never installed can never be resurrected here.
+        var manifestKeys = Set<KittyPlacementKey>()
+        for placement in manifest.placements {
+            manifestKeys.insert(KittyPlacementKey(imageId: placement.imageID, placementId: placement.placementID))
+        }
+        // Live headless placeholder rows with their first-line anchors.
+        // Only `KittyHeadlessPlacementImage` rows count: attached stripes
+        // from an already-installed image are not re-ticketed.
+        var firstLineByKey: [KittyPlacementKey: Int] = [:]
+        var colByKey: [KittyPlacementKey: Int] = [:]
+        for rowIndex in 0..<buffer.lines.count {
+            guard let images = buffer.lines[rowIndex].images else { continue }
+            for image in images {
+                guard image is KittyHeadlessPlacementImage,
+                      let kitty = image as? KittyPlacementImage,
+                      let imageID = kitty.kittyImageId,
+                      let placementID = kitty.kittyPlacementId else { continue }
+                let key = KittyPlacementKey(imageId: imageID, placementId: placementID)
+                if let existing = firstLineByKey[key] {
+                    if rowIndex < existing {
+                        firstLineByKey[key] = rowIndex
+                        colByKey[key] = image.col
+                    }
+                } else {
+                    firstLineByKey[key] = rowIndex
+                    colByKey[key] = image.col
+                }
+            }
+        }
+        let cellSize = tdel?.cellSizeInPixels(source: self)
+        let epoch = hostedGraphicsEpoch
+        let originLinesTop = buffer.linesTop
+        let isAlt = isCurrentBufferAlternate
+        var tickets: [HostedKittyRenderRequest] = []
+        for key in manifestKeys.sorted(by: { ($0.imageId, $0.placementId) < ($1.imageId, $1.placementId) }) {
+            // Survival: placeholder rows, a live record in the current
+            // buffer, and no stored payload (a replaced placement already
+            // committed its new bytes; re-ticketing would clobber them).
+            guard let firstLine = firstLineByKey[key],
+                  let record = kittyGraphicsState.placementsByKey[key],
+                  record.isAlternateBuffer == isAlt,
+                  kittyGraphicsState.imagesById[key.imageId] == nil,
+                  let snapshotImage = payloadByID[key.imageId] else { continue }
+            let rawBytes: Data
+            let format: Int
+            let rawWidth: Int
+            let rawHeight: Int
+            switch snapshotImage.payload {
+            case .png(let data):
+                rawBytes = data
+                format = 100
+                rawWidth = 0
+                rawHeight = 0
+            case .rgba(let data, let width, let height):
+                rawBytes = data
+                format = 32
+                rawWidth = width
+                rawHeight = height
+            }
+            tickets.append(HostedKittyRenderRequest(epoch: epoch,
+                                                      originLinesTop: originLinesTop,
+                                                      imageId: key.imageId,
+                                                      imageNumber: snapshotImage.number,
+                                                      placementId: key.placementId,
+                                                      columns: record.cols,
+                                                      rows: record.rows,
+                                                      zIndex: record.zIndex,
+                                                      pixelOffsetX: record.pixelOffsetX,
+                                                      pixelOffsetY: record.pixelOffsetY,
+                                                      format: format,
+                                                      rawWidth: rawWidth,
+                                                      rawHeight: rawHeight,
+                                                      compression: nil,
+                                                      base64Payload: Array(rawBytes.base64EncodedString().utf8),
+                                                      isAlternateBuffer: isAlt,
+                                                      cellWidthPx: cellSize?.width,
+                                                      cellHeightPx: cellSize?.height,
+                                                      anchorCol: colByKey[key] ?? record.col,
+                                                      anchorRow: firstLine))
+        }
+        return tickets
+    }
+
     /// Two-phase hosted handler for transmit-and-display with a direct
     /// payload. Always consumes the sequence when two-phase rendering is
     /// enabled: eligible transmissions record cursor-anchored placement,
