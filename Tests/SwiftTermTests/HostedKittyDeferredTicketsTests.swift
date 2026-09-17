@@ -143,12 +143,11 @@ final class HostedKittyDeferredTicketsTests {
         #expect(target.kittyGraphicsState.imagesById.isEmpty)
         #expect(target.takePendingHostedKittyRenders().isEmpty)
 
-        // The ticket round-trips the exact snapshot bytes.
-        guard let roundTripped = Data(base64Encoded: Data(ticket.base64Payload)) else {
-            Issue.record("ticket payload is not valid base64")
-            return
-        }
-        #expect(roundTripped == Data([255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255]))
+        // The ticket shares the exact snapshot bytes without any
+        // feeding-thread base64 work: no re-encoding on ticket creation,
+        // no duplicate decode in prepare beyond the shared unique bytes.
+        #expect(ticket.base64Payload.isEmpty)
+        #expect(ticket.rawSourceBytes == Data([255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255]))
 
         // Full two-phase flow: off-thread prepare, feeding-thread install.
         guard case .success(let prepared) = prepareHostedKittyBatch(tickets) else {
@@ -180,7 +179,8 @@ final class HostedKittyDeferredTicketsTests {
         }
         #expect(tickets.count == 1)
         #expect(tickets[0].format == 100)
-        #expect(Data(base64Encoded: Data(tickets[0].base64Payload)) == Data(base64Encoded: png1x1Base64))
+        #expect(tickets[0].base64Payload.isEmpty)
+        #expect(tickets[0].rawSourceBytes == Data(base64Encoded: png1x1Base64))
 
 #if canImport(ImageIO)
         guard case .success(let prepared) = prepareHostedKittyBatch(tickets) else {
@@ -361,6 +361,138 @@ final class HostedKittyDeferredTicketsTests {
         for i in normalizedSecond.indices { normalizedSecond[i].enqueuedAt = Date(timeIntervalSince1970: 0) }
         #expect(normalizedFirst == normalizedSecond)
         #expect(first.count == 1)
+    }
+
+    @Test func testMultiplePlacementsShareOnePayloadWithoutReencoding() {
+        // One 2x2 RGBA image displayed in two placements: the reconnect
+        // snapshot carries the payload once, and ticket construction must
+        // share those unique bytes across both tickets with no
+        // feeding-thread base64 work and no per-placement copies.
+        let bytes = Data([255, 0, 0, 255,
+                          0, 255, 0, 255,
+                          0, 0, 255, 255,
+                          255, 255, 255, 255])
+        let manifest = TerminalKittyGraphicsManifest(
+            retainedLineCount: 5,
+            placements: [
+                TerminalKittyGraphicsSnapshot.Placement(imageID: 7, imageNumber: nil, placementID: 1,
+                                                        column: 0, relativeRow: 0, columns: 3, rows: 2,
+                                                        zIndex: 0, pixelOffsetX: 0, pixelOffsetY: 0),
+                TerminalKittyGraphicsSnapshot.Placement(imageID: 7, imageNumber: nil, placementID: 2,
+                                                        column: 0, relativeRow: 2, columns: 3, rows: 2,
+                                                        zIndex: 0, pixelOffsetX: 0, pixelOffsetY: 0),
+            ])
+        let payloads = TerminalKittyGraphicsPayloadSnapshot(
+            images: [TerminalKittyGraphicsSnapshot.Image(id: 7, number: nil,
+                                                         payload: .rgba(bytes, width: 2, height: 2))])
+        let (target, _) = makeTerminal()
+        guard target.prepareKittyGraphicsManifest(manifest) else {
+            Issue.record("expected manifest install")
+            return
+        }
+        guard let tickets = target.makeHostedKittyDeferredTickets(manifest: manifest,
+                                                                  payloads: payloads) else {
+            Issue.record("expected tickets, got nil")
+            return
+        }
+        #expect(tickets.count == 2)
+        // No main-side base64 or re-encoding: every ticket leaves the
+        // wire-encoding field empty and aliases the same snapshot bytes.
+        #expect(tickets.allSatisfy { $0.base64Payload.isEmpty })
+        #expect(tickets[0].rawSourceBytes == bytes)
+        #expect(tickets[1].rawSourceBytes == bytes)
+        #expect(tickets[0].rawSourceBytes == tickets[1].rawSourceBytes)
+        #expect(tickets[0].format == 32)
+        #expect(tickets[1].format == 32)
+        #expect(Set(tickets.map(\.placementId)) == [1, 2])
+
+        // Bounded unique-byte preparation: one shared decode for both
+        // placements, then a full install of each placement.
+        guard case .success(let prepared) = prepareHostedKittyBatch(tickets) else {
+            Issue.record("expected batch preparation to succeed")
+            return
+        }
+        #expect(prepared.count == 2)
+        #expect(prepared.allSatisfy { $0.rgba == bytes })
+        let outcome = target.installHostedKittyPreparedImages(prepared)
+        #expect(outcome == .installed(placements: 2))
+        #expect(target.kittyGraphicsState.imagesById[7] != nil)
+    }
+
+    @Test func testSharedPNGPlacementsPrepareOnceAndInstall() {
+#if canImport(ImageIO)
+        guard let pngBytes = Data(base64Encoded: png1x1Base64) else {
+            Issue.record("expected fixture PNG to decode")
+            return
+        }
+        let manifest = TerminalKittyGraphicsManifest(
+            retainedLineCount: 5,
+            placements: [
+                TerminalKittyGraphicsSnapshot.Placement(imageID: 9, imageNumber: nil, placementID: 1,
+                                                        column: 0, relativeRow: 0, columns: 2, rows: 1,
+                                                        zIndex: 0, pixelOffsetX: 0, pixelOffsetY: 0),
+                TerminalKittyGraphicsSnapshot.Placement(imageID: 9, imageNumber: nil, placementID: 2,
+                                                        column: 0, relativeRow: 2, columns: 2, rows: 1,
+                                                        zIndex: 0, pixelOffsetX: 0, pixelOffsetY: 0),
+            ])
+        let payloads = TerminalKittyGraphicsPayloadSnapshot(
+            images: [TerminalKittyGraphicsSnapshot.Image(id: 9, number: nil,
+                                                         payload: .png(pngBytes))])
+        let (target, _) = makeTerminal()
+        guard target.prepareKittyGraphicsManifest(manifest) else {
+            Issue.record("expected manifest install")
+            return
+        }
+        guard let tickets = target.makeHostedKittyDeferredTickets(manifest: manifest,
+                                                                  payloads: payloads) else {
+            Issue.record("expected tickets, got nil")
+            return
+        }
+        #expect(tickets.count == 2)
+        #expect(tickets.allSatisfy { $0.base64Payload.isEmpty })
+        #expect(tickets[0].rawSourceBytes == pngBytes)
+        #expect(tickets[0].rawSourceBytes == tickets[1].rawSourceBytes)
+        guard case .success(let prepared) = prepareHostedKittyBatch(tickets) else {
+            Issue.record("expected PNG batch preparation to succeed")
+            return
+        }
+        #expect(prepared.count == 2)
+        #expect(prepared.allSatisfy { $0.width == 1 && $0.height == 1 })
+        let outcome = target.installHostedKittyPreparedImages(prepared)
+        #expect(outcome == .installed(placements: 2))
+        #expect(target.kittyGraphicsState.imagesById[9] != nil)
+#endif
+    }
+
+    @Test func testBatchDoesNotAliasRastersAcrossMismatchedBytes() {
+        // Same image id, different payload bytes: the batch cache must not
+        // let the second ticket reuse the first ticket's raster. Store-only
+        // (zero-grid) tickets keep preparation to decode-plus-validate.
+        let red = Data([255, 0, 0, 255,
+                        0, 255, 0, 255,
+                        0, 0, 255, 255,
+                        255, 255, 255, 255])
+        let green = Data([0, 255, 0, 255,
+                          0, 255, 0, 255,
+                          0, 0, 255, 255,
+                          255, 255, 255, 255])
+        func ticket(placementId: UInt32, bytes: Data) -> HostedKittyRenderRequest {
+            HostedKittyRenderRequest(epoch: 0, originLinesTop: 0,
+                                      imageId: 7, imageNumber: nil, placementId: placementId,
+                                      columns: 0, rows: 0,
+                                      zIndex: 0, pixelOffsetX: 0, pixelOffsetY: 0,
+                                      format: 32, rawWidth: 2, rawHeight: 2,
+                                      compression: nil, base64Payload: [],
+                                      rawSourceBytes: bytes, isAlternateBuffer: false)
+        }
+        guard case .success(let prepared) = prepareHostedKittyBatch([ticket(placementId: 1, bytes: red),
+                                                                      ticket(placementId: 2, bytes: green)]) else {
+            Issue.record("expected batch preparation to succeed")
+            return
+        }
+        #expect(prepared.count == 2)
+        #expect(prepared[0].rgba == red)
+        #expect(prepared[1].rgba == green)
     }
 
     @Test func testScrollBetweenTicketAndInstallStillInstalls() {

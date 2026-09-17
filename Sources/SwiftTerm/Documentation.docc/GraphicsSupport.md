@@ -130,10 +130,26 @@ with matching snapshot payloads — capturing the current epoch, buffer
 identity, `linesTop`/anchors, and delegate cell geometry — so the tickets
 flow through ``prepareHostedKittyBatch`` and
 ``Terminal/installHostedKittyPreparedImages`` exactly like parser-produced
-tickets. Ticket creation is strictly read-only (no cursor movement, APC
+tickets. Ticket creation validates structure and captures placement
+metadata only: it performs no payload decode, base64 transform, or raster
+work, and shares each image's immutable snapshot bytes (`rawSourceBytes`)
+across every placement referencing that image, so feeding-thread work
+scales with unique image bytes rather than placement multiplicity.
+`base64Payload` stays empty on these tickets; all decode, admission,
+scaling, and striping happen in ``prepareHostedKittyBatch`` (any thread),
+which reuses one decoded source raster per unique image while still
+computing per-placement crops, scales, and stripes independently.
+Ticket creation is strictly read-only (no cursor movement, APC
 replies, placeholder rows, or payload storage) and never resurrects
 deleted or replaced placements; it returns nil for version/structural
 invalidity and an empty array when nothing survived.
+
+The method name, parameters, return type, and call sequence are unchanged
+from the initial deferred-tickets patch, so existing callers adopt this
+fix with a version pin only: build tickets on the feeding thread, prepare
+the batch off-thread, install the prepared images back on the feeding
+thread. Callers must not read `base64Payload` on deferred tickets (it is
+empty by design); pass tickets opaquely through `prepare`/`install`.
 
 ## Implementing Graphics in a Custom Front-End
 

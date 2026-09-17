@@ -1944,10 +1944,20 @@ extension Terminal {
     /// manifest placement that still owns live headless placeholder rows,
     /// still has its placement record in the current buffer, has no stored
     /// payload yet, and has a matching image in `payloads`, this returns one
-    /// immutable `HostedKittyRenderRequest` carrying the payload re-encoded
-    /// exactly as received on the wire. PNG snapshot payloads become
-    /// `f=100` tickets; RGBA snapshot payloads become `f=32` tickets with
-    /// their stored dimensions.
+    /// immutable `HostedKittyRenderRequest` sharing that image's raw
+    /// snapshot payload bytes. PNG snapshot payloads become `f=100`
+    /// tickets; RGBA snapshot payloads become `f=32` tickets with their
+    /// stored dimensions.
+    ///
+    /// Ticket construction performs no payload decode, base64 transform, or
+    /// raster work: it only validates structure, captures placement
+    /// metadata (epoch, buffer identity, `linesTop`, anchors, cell
+    /// geometry), and shares each image's immutable snapshot `Data` across
+    /// every placement referencing it, so feeding-thread work scales with
+    /// unique image bytes rather than placement multiplicity. All payload
+    /// decode, validation against admission limits, scaling, and striping
+    /// happen in `prepareHostedKittyBatch` (any thread), which reuses one
+    /// decoded source raster per unique image.
     ///
     /// Each ticket captures the current `hostedGraphicsEpoch`, buffer
     /// identity, `buffer.linesTop`, the live first-row anchor, and the
@@ -1962,9 +1972,10 @@ extension Terminal {
     /// enqueues parser tickets, or resurrects deleted/replaced placements.
     /// Removed placements (no surviving placeholder rows or record) and
     /// replaced placements (payload already stored under the image id) are
-    /// silently omitted. No image bytes are decoded here: payload-size and
-    /// cache admission stay in `prepare`/`install`, which reject what does
-    /// not fit.
+    /// silently omitted. No image bytes are decoded, re-encoded, or copied
+    /// here beyond aliasing the snapshot's immutable `Data`: payload-size
+    /// and cache admission stay in `prepare`/`install`, which reject what
+    /// does not fit.
     ///
     /// - Returns: nil when `manifest` or `payloads` has a non-`1` version
     ///   or is structurally invalid (empty manifest range, non-positive
@@ -2048,18 +2059,23 @@ extension Terminal {
                   record.isAlternateBuffer == isAlt,
                   kittyGraphicsState.imagesById[key.imageId] == nil,
                   let snapshotImage = payloadByID[key.imageId] else { continue }
-            let rawBytes: Data
+            // Shared immutable payload reference: the ticket aliases the
+            // snapshot's `Data` (copy-on-write) without copying, encoding,
+            // or decoding any bytes here. `prepare` resolves these raw
+            // bytes off-thread; `base64Payload` stays empty so no caller
+            // can mistake the ticket for a wire-encoded parser ticket.
+            let sharedBytes: Data
             let format: Int
             let rawWidth: Int
             let rawHeight: Int
             switch snapshotImage.payload {
             case .png(let data):
-                rawBytes = data
+                sharedBytes = data
                 format = 100
                 rawWidth = 0
                 rawHeight = 0
             case .rgba(let data, let width, let height):
-                rawBytes = data
+                sharedBytes = data
                 format = 32
                 rawWidth = width
                 rawHeight = height
@@ -2078,7 +2094,8 @@ extension Terminal {
                                                       rawWidth: rawWidth,
                                                       rawHeight: rawHeight,
                                                       compression: nil,
-                                                      base64Payload: Array(rawBytes.base64EncodedString().utf8),
+                                                      base64Payload: [],
+                                                      rawSourceBytes: sharedBytes,
                                                       isAlternateBuffer: isAlt,
                                                       cellWidthPx: cellSize?.width,
                                                       cellHeightPx: cellSize?.height,

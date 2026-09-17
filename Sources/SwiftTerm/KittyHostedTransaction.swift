@@ -128,7 +128,21 @@ public struct HostedKittyRenderRequest: Sendable, Equatable {
     public var compression: Character?
     /// Raw base64 payload bytes exactly as received in the APC sequence.
     /// Base64 decoding and decompression happen in `prepare`, off-thread.
+    /// Deferred reconnect tickets leave this empty and carry
+    /// `rawSourceBytes` instead, so feeding-thread ticket construction
+    /// performs no base64 work.
     public var base64Payload: [UInt8]
+    /// Immutable raw snapshot payload bytes shared by deferred reconnect
+    /// tickets: PNG file bytes for `f=100`, packed RGBA bytes for `f=32`.
+    /// Nil for parser-produced tickets (which carry `base64Payload`). When
+    /// non-nil, `prepare` uses these bytes directly and ignores
+    /// `base64Payload`, so all decode/transform/raster work stays in the
+    /// off-main prepare path. The value shares the snapshot's `Data`
+    /// storage (copy-on-write) across every placement referencing one
+    /// image, bounding ticket work by unique image bytes rather than
+    /// placement multiplicity. Never compressed; deferred tickets always
+    /// set `compression` to nil.
+    public var rawSourceBytes: Data?
     public var isAlternateBuffer: Bool
     /// View cell size in pixels captured on the feeding thread. Nil for
     /// headless terminals (no delegate cell size): preparation then produces
@@ -179,6 +193,7 @@ public struct HostedKittyRenderRequest: Sendable, Equatable {
                 rawHeight: Int,
                 compression: Character?,
                 base64Payload: [UInt8],
+                rawSourceBytes: Data? = nil,
                 isAlternateBuffer: Bool,
                 cellWidthPx: Int? = nil,
                 cellHeightPx: Int? = nil,
@@ -210,6 +225,7 @@ public struct HostedKittyRenderRequest: Sendable, Equatable {
         self.rawHeight = rawHeight
         self.compression = compression
         self.base64Payload = base64Payload
+        self.rawSourceBytes = rawSourceBytes
         self.isAlternateBuffer = isAlternateBuffer
         self.cellWidthPx = cellWidthPx
         self.cellHeightPx = cellHeightPx
@@ -441,21 +457,75 @@ public enum HostedKittyInstallOutcome: Sendable, Equatable {
 /// `Terminal`, buffers, delegates, or views, so callers may run it on any
 /// background executor. Decodes the payload, applies crops, and rasterizes
 /// the fully scaled canvas plus one bounded RGBA stripe per placement row.
+///
+/// Tickets carrying `rawSourceBytes` (deferred reconnect tickets) skip the
+/// base64 decode and use the shared raw bytes directly; every other step —
+/// admission limits, rasterization, crops, scaling, striping — is identical
+/// to parser-produced tickets.
 public func prepareHostedKittyRender(_ request: HostedKittyRenderRequest,
                                      limits: HostedKittyGraphicsLimits = .default) -> Result<HostedKittyPreparedImage, HostedKittyPrepareError> {
+    guard hostedPrepareGeometry(request: request, limits: limits) else {
+        return .failure(.badDimensions)
+    }
+    let rawResult = resolveHostedRawData(request: request, limits: limits)
+    let rawData: Data
+    switch rawResult {
+    case .success(let bytes):
+        rawData = bytes
+    case .failure(let error):
+        return .failure(error)
+    }
+    let rasterResult = rasterizeHostedSource(request: request, rawData: rawData, limits: limits)
+    let raster: (rgba: Data, width: Int, height: Int)
+    switch rasterResult {
+    case .success(let decoded):
+        raster = decoded
+    case .failure(let error):
+        return .failure(error)
+    }
+    return finishHostedPrepare(request: request, sourceRGBA: raster.rgba,
+                               sourceWidth: raster.width, sourceHeight: raster.height,
+                               limits: limits)
+}
+
+/// Validates placement-grid geometry shared by the single and batch prepare
+/// paths. Returns nil when the ticket grid is invalid.
+private func hostedPrepareGeometry(request: HostedKittyRenderRequest,
+                                   limits: HostedKittyGraphicsLimits) -> Bool {
     // Zero grids are store-only (headless auto-size, mirroring the inline
     // path which registers nothing without a cell size): decode and validate
     // the payload for storage, but produce no stripes.
     guard request.columns >= 0, request.rows >= 0,
           request.columns <= limits.maxImageDimension,
           request.rows <= limits.maxImageDimension else {
-        return .failure(.badDimensions)
+        return false
     }
     // Checked cell-area product: untrusted ticket geometry must never trap
     // near Int.max (prepare is public API and tickets can be hand-built).
     let (placementCells, cellsOverflow) = request.columns.multipliedReportingOverflow(by: request.rows)
     guard !cellsOverflow, placementCells <= limits.maxPlacementCells else {
-        return .failure(.badDimensions)
+        return false
+    }
+    return true
+}
+
+/// Resolves the raw (post-base64, post-inflation) source bytes for one
+/// ticket. Deferred tickets carry immutable `rawSourceBytes` shared with
+/// the payload snapshot: no base64 work happens here beyond reusing those
+/// bytes. Parser tickets decode `base64Payload` exactly as before.
+private func resolveHostedRawData(request: HostedKittyRenderRequest,
+                                  limits: HostedKittyGraphicsLimits) -> Result<Data, HostedKittyPrepareError> {
+    if let shared = request.rawSourceBytes {
+        guard request.compression == nil else {
+            return .failure(.unsupportedCompression)
+        }
+        guard !shared.isEmpty else {
+            return .failure(.emptyPayload)
+        }
+        guard shared.count <= limits.maxPayloadBytes else {
+            return .failure(.exceedsPayloadLimit(bytes: shared.count, limit: limits.maxPayloadBytes))
+        }
+        return .success(shared)
     }
     guard !request.base64Payload.isEmpty else {
         return .failure(.emptyPayload)
@@ -484,8 +554,16 @@ public func prepareHostedKittyRender(_ request: HostedKittyRenderRequest,
     guard rawData.count <= limits.maxPayloadBytes else {
         return .failure(.exceedsPayloadLimit(bytes: rawData.count, limit: limits.maxPayloadBytes))
     }
+    return .success(rawData)
+}
 
-    let raster: (rgba: Data, width: Int, height: Int)
+/// Rasterizes resolved raw bytes to a pre-crop source raster. Pure function
+/// of `(format, rawWidth/rawHeight, raw bytes)` plus limits, so batch
+/// preparation can reuse one raster across every placement sharing an
+/// image while still applying per-placement crops, scales, and stripes.
+private func rasterizeHostedSource(request: HostedKittyRenderRequest,
+                                   rawData: Data,
+                                   limits: HostedKittyGraphicsLimits) -> Result<(rgba: Data, width: Int, height: Int), HostedKittyPrepareError> {
     switch request.format {
     case 100:
         // Dimensions are verified from the header before any ImageIO decode
@@ -502,7 +580,7 @@ public func prepareHostedKittyRender(_ request: HostedKittyRenderRequest,
         guard let decoded = HostedKittyImageDecoder.rasterizePNG(rawData, maxDimension: limits.maxImageDimension, maxRGBABytes: limits.maxPayloadBytes) else {
             return .failure(.undecodableImage)
         }
-        raster = decoded
+        return .success(decoded)
     case 24:
         guard HostedKittyImageDecoder.validateDimensions(width: request.rawWidth, height: request.rawHeight, maxDimension: limits.maxImageDimension) else {
             return .failure(.badDimensions)
@@ -533,7 +611,7 @@ public func prepareHostedKittyRender(_ request: HostedKittyRenderRequest,
                 }
             }
         }
-        raster = (rgba, request.rawWidth, request.rawHeight)
+        return .success((rgba, request.rawWidth, request.rawHeight))
     case 32:
         guard HostedKittyImageDecoder.validateDimensions(width: request.rawWidth, height: request.rawHeight, maxDimension: limits.maxImageDimension) else {
             return .failure(.badDimensions)
@@ -541,22 +619,30 @@ public func prepareHostedKittyRender(_ request: HostedKittyRenderRequest,
         guard Int64(request.rawWidth) * Int64(request.rawHeight) * 4 == Int64(rawData.count) else {
             return .failure(.badDimensions)
         }
-        raster = (rawData, request.rawWidth, request.rawHeight)
+        return .success((rawData, request.rawWidth, request.rawHeight))
     default:
         return .failure(.unsupportedFormat(request.format))
     }
+}
 
-    var sourceRGBA = raster.rgba
-    var sourceWidth = raster.width
-    var sourceHeight = raster.height
+/// Applies the per-placement crop, then either stores the source raster or
+/// scales and slices stripes. Shared by the single and batch prepare paths.
+private func finishHostedPrepare(request: HostedKittyRenderRequest,
+                                 sourceRGBA: Data,
+                                 sourceWidth: Int,
+                                 sourceHeight: Int,
+                                 limits: HostedKittyGraphicsLimits) -> Result<HostedKittyPreparedImage, HostedKittyPrepareError> {
+    var croppedRGBA = sourceRGBA
+    var croppedWidth = sourceWidth
+    var croppedHeight = sourceHeight
     if request.cropX != 0 || request.cropY != 0 || request.cropWidth != 0 || request.cropHeight != 0 {
-        guard let cropped = HostedKittyImageDecoder.cropRGBA(bytes: sourceRGBA, width: sourceWidth, height: sourceHeight,
+        guard let cropped = HostedKittyImageDecoder.cropRGBA(bytes: croppedRGBA, width: croppedWidth, height: croppedHeight,
                                                              x: request.cropX, y: request.cropY, w: request.cropWidth, h: request.cropHeight) else {
             return .failure(.badDimensions)
         }
-        sourceRGBA = cropped.bytes
-        sourceWidth = cropped.width
-        sourceHeight = cropped.height
+        croppedRGBA = cropped.bytes
+        croppedWidth = cropped.width
+        croppedHeight = cropped.height
     }
 
     func storeOnly() -> Result<HostedKittyPreparedImage, HostedKittyPrepareError> {
@@ -570,9 +656,9 @@ public func prepareHostedKittyRender(_ request: HostedKittyRenderRequest,
                                                  zIndex: request.zIndex,
                                                  pixelOffsetX: request.pixelOffsetX,
                                                  pixelOffsetY: request.pixelOffsetY,
-                                                 rgba: sourceRGBA,
-                                                 width: sourceWidth,
-                                                 height: sourceHeight,
+                                                 rgba: croppedRGBA,
+                                                 width: croppedWidth,
+                                                 height: croppedHeight,
                                                  isAlternateBuffer: request.isAlternateBuffer,
                                                  anchorCol: request.anchorCol,
                                                  anchorRow: request.anchorRow,
@@ -602,7 +688,7 @@ public func prepareHostedKittyRender(_ request: HostedKittyRenderRequest,
     guard !widthOverflow, !heightOverflow else {
         return .failure(.exceedsRenderedLimit(bytes: Int.max, limit: limits.maxPayloadBytes))
     }
-    guard let scaled = HostedKittyImageDecoder.scaleToCanvas(source: sourceRGBA, sourceWidth: sourceWidth, sourceHeight: sourceHeight,
+    guard let scaled = HostedKittyImageDecoder.scaleToCanvas(source: croppedRGBA, sourceWidth: croppedWidth, sourceHeight: croppedHeight,
                                                              targetWidth: targetWidth, targetHeight: targetHeight,
                                                              maxBytes: limits.maxPayloadBytes) else {
         return .failure(.exceedsRenderedLimit(bytes: Int.max, limit: limits.maxPayloadBytes))
@@ -622,9 +708,9 @@ public func prepareHostedKittyRender(_ request: HostedKittyRenderRequest,
                                              zIndex: request.zIndex,
                                              pixelOffsetX: request.pixelOffsetX,
                                              pixelOffsetY: request.pixelOffsetY,
-                                             rgba: sourceRGBA,
-                                             width: sourceWidth,
-                                             height: sourceHeight,
+                                             rgba: croppedRGBA,
+                                             width: croppedWidth,
+                                             height: croppedHeight,
                                              isAlternateBuffer: request.isAlternateBuffer,
                                              stripes: stripes,
                                              scaledWidth: scaled.width,
@@ -647,13 +733,57 @@ public func prepareHostedKittyRender(_ request: HostedKittyRenderRequest,
 /// mixture of valid and invalid placements. The aggregate source-plus-
 /// rendered bytes are capped with checked arithmetic before the batch result
 /// is retained, so one feed cannot pin unbounded in-flight memory.
+///
+/// Source decode work scales with unique image bytes, not placement
+/// multiplicity: the pre-crop source raster is computed once per image id
+/// and reused across placements whose payload bytes, format, raw
+/// dimensions, and compression all match. A byte mismatch under a repeated
+/// image id disables reuse for that ticket (which prepares independently),
+/// so hand-built batches can never Alias one image's raster onto another.
+/// Per-placement crops, scales, and stripes are always computed
+/// independently, since placement geometry may differ.
 public func prepareHostedKittyBatch(_ requests: [HostedKittyRenderRequest],
                                     limits: HostedKittyGraphicsLimits = .default) -> Result<[HostedKittyPreparedImage], HostedKittyPrepareError> {
     var prepared: [HostedKittyPreparedImage] = []
     prepared.reserveCapacity(requests.count)
     var inFlight = 0
+    var rasterCache: [UInt32: (fingerprint: HostedBatchFingerprint, raster: (rgba: Data, width: Int, height: Int))] = [:]
     for request in requests {
-        switch prepareHostedKittyRender(request, limits: limits) {
+        let preparedResult: Result<HostedKittyPreparedImage, HostedKittyPrepareError>
+        if let cached = rasterCache[request.imageId],
+           cached.fingerprint.matches(request: request) {
+            guard hostedPrepareGeometry(request: request, limits: limits) else {
+                return .failure(.badDimensions)
+            }
+            preparedResult = finishHostedPrepare(request: request, sourceRGBA: cached.raster.rgba,
+                                                 sourceWidth: cached.raster.width, sourceHeight: cached.raster.height,
+                                                 limits: limits)
+        } else {
+            guard hostedPrepareGeometry(request: request, limits: limits) else {
+                return .failure(.badDimensions)
+            }
+            let rawResult = resolveHostedRawData(request: request, limits: limits)
+            let rawData: Data
+            switch rawResult {
+            case .success(let bytes):
+                rawData = bytes
+            case .failure(let error):
+                return .failure(error)
+            }
+            let rasterResult = rasterizeHostedSource(request: request, rawData: rawData, limits: limits)
+            let raster: (rgba: Data, width: Int, height: Int)
+            switch rasterResult {
+            case .success(let decoded):
+                raster = decoded
+            case .failure(let error):
+                return .failure(error)
+            }
+            rasterCache[request.imageId] = (HostedBatchFingerprint(request: request), raster)
+            preparedResult = finishHostedPrepare(request: request, sourceRGBA: raster.rgba,
+                                                 sourceWidth: raster.width, sourceHeight: raster.height,
+                                                 limits: limits)
+        }
+        switch preparedResult {
         case .success(let image):
             let (itemCost, costOverflow) = image.rgba.count.addingReportingOverflow(image.renderedByteCost)
             let (total, totalOverflow) = inFlight.addingReportingOverflow(itemCost)
@@ -667,6 +797,44 @@ public func prepareHostedKittyBatch(_ requests: [HostedKittyRenderRequest],
         }
     }
     return .success(prepared)
+}
+
+/// Batch-cache identity for one ticket's source payload: the exact input
+/// bytes plus the fields that select the rasterizer. Byte comparison runs
+/// off-thread in prepare; the feeding thread never computes it.
+private struct HostedBatchFingerprint {
+    var format: Int
+    var rawWidth: Int
+    var rawHeight: Int
+    var compression: Character?
+    var rawBytes: Data?
+    var base64Bytes: [UInt8]?
+
+    init(request: HostedKittyRenderRequest) {
+        self.format = request.format
+        self.rawWidth = request.rawWidth
+        self.rawHeight = request.rawHeight
+        self.compression = request.compression
+        self.rawBytes = request.rawSourceBytes
+        if request.rawSourceBytes == nil {
+            self.base64Bytes = request.base64Payload
+        } else {
+            self.base64Bytes = nil
+        }
+    }
+
+    func matches(request: HostedKittyRenderRequest) -> Bool {
+        guard format == request.format,
+              rawWidth == request.rawWidth,
+              rawHeight == request.rawHeight,
+              compression == request.compression else {
+            return false
+        }
+        if let rawBytes {
+            return request.rawSourceBytes == rawBytes
+        }
+        return request.rawSourceBytes == nil && request.base64Payload == base64Bytes
+    }
 }
 
 /// Thread-safe image decoding, scaling, and slicing helpers for the two-phase
