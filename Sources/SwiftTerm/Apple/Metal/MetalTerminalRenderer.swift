@@ -2849,6 +2849,18 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
            let resourceBundle = Bundle(url: url) {
             bundles.append(resourceBundle)
         }
+        // SwiftPM debug test layout: the test process's Bundle.main is the
+        // toolchain runner shim, not the .xctest, so main-relative probes
+        // cannot see it. Bundle(for:) IS the .xctest here, with the resource
+        // bundle beside it as `.../debug/<bundleName>`, not inside it. Probe
+        // that module sibling directory so `swift test` finds the shaders.
+        // No baked build paths, no cwd reliance: purely module-relative, and
+        // a missing sibling simply yields no candidate.
+        let moduleSiblingURL = Bundle(for: MetalTerminalRenderer.self).bundleURL
+            .deletingLastPathComponent().appendingPathComponent(bundleName)
+        if let resourceBundle = Bundle(url: moduleSiblingURL) {
+            bundles.append(resourceBundle)
+        }
         #endif
         bundles.append(Bundle(for: MetalTerminalRenderer.self))
         bundles.append(Bundle.main)
