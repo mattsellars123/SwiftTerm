@@ -49,7 +49,21 @@ import ImageIO
 public struct HostedKittyGraphicsLimits: Sendable, Equatable {
     /// Maximum accepted size of one decoded payload, in bytes. Defaults to
     /// 8 MiB to align with bounded authoritative-graphics transfer budgets.
+    /// This is the wire budget: base64-decoded file bytes, inflated bytes,
+    /// and deferred raw snapshot bytes. It never constrains the decoded
+    /// source raster or the scaled canvas (see below).
     public var maxPayloadBytes: Int
+    /// Maximum accepted decoded source raster (`width * height * 4` RGBA
+    /// bytes), checked from verified headers before any decode or
+    /// allocation. Distinct from the wire budget: a PNG that compresses to
+    /// kilobytes on the wire may legitimately decode to tens of megabytes.
+    /// Defaults to 32 MiB, which admits ordinary 4K frames and
+    /// <=2000-dimension resized screenshots while still bounding any single
+    /// raster allocation.
+    public var maxDecodedRasterBytes: Int
+    /// Maximum accepted scaled-canvas bytes for one placement's stripes.
+    /// Defaults to 8 MiB.
+    public var maxRenderedBytes: Int
     /// Maximum accepted decoded image dimension, in pixels per side.
     public var maxImageDimension: Int
     /// Maximum accepted placement area, in cells. Bounds parse-time line
@@ -78,6 +92,8 @@ public struct HostedKittyGraphicsLimits: Sendable, Equatable {
     public var maxHostedPlacements: Int
 
     public init(maxPayloadBytes: Int = 8 * 1024 * 1024,
+                maxDecodedRasterBytes: Int = 32 * 1024 * 1024,
+                maxRenderedBytes: Int = 8 * 1024 * 1024,
                 maxImageDimension: Int = 10000,
                 maxPlacementCells: Int = 65536,
                 maxPartialEncodedBytes: Int = 12 * 1024 * 1024,
@@ -87,6 +103,8 @@ public struct HostedKittyGraphicsLimits: Sendable, Equatable {
                 maxAnonymousPlacements: Int = 16,
                 maxHostedPlacements: Int = 1024) {
         self.maxPayloadBytes = maxPayloadBytes
+        self.maxDecodedRasterBytes = maxDecodedRasterBytes
+        self.maxRenderedBytes = maxRenderedBytes
         self.maxImageDimension = maxImageDimension
         self.maxPlacementCells = maxPlacementCells
         self.maxPartialEncodedBytes = maxPartialEncodedBytes
@@ -385,6 +403,7 @@ public enum HostedKittyPrepareError: Error, Sendable, Equatable {
     case unsupportedCompression
     case badDimensions
     case exceedsPayloadLimit(bytes: Int, limit: Int)
+    case exceedsDecodedRasterLimit(bytes: Int, limit: Int)
     case exceedsRenderedLimit(bytes: Int, limit: Int)
     case exceedsBatchLimit(bytes: Int, limit: Int)
     case undecodableImage
@@ -587,10 +606,10 @@ private func rasterizeHostedSource(request: HostedKittyRenderRequest,
             return .failure(.badDimensions)
         }
         let rgbaCost = Int64(headerSize.width) * Int64(headerSize.height) * 4
-        guard rgbaCost <= Int64(limits.maxPayloadBytes) else {
-            return .failure(.exceedsPayloadLimit(bytes: Int(min(rgbaCost, Int64(Int.max))), limit: limits.maxPayloadBytes))
+        guard rgbaCost <= Int64(limits.maxDecodedRasterBytes) else {
+            return .failure(.exceedsDecodedRasterLimit(bytes: Int(min(rgbaCost, Int64(Int.max))), limit: limits.maxDecodedRasterBytes))
         }
-        guard let decoded = HostedKittyImageDecoder.rasterizePNG(rawData, maxDimension: limits.maxImageDimension, maxRGBABytes: limits.maxPayloadBytes) else {
+        guard let decoded = HostedKittyImageDecoder.rasterizePNG(rawData, maxDimension: limits.maxImageDimension, maxRGBABytes: limits.maxDecodedRasterBytes) else {
             return .failure(.undecodableImage)
         }
         return .success(decoded)
@@ -603,8 +622,8 @@ private func rasterizeHostedSource(request: HostedKittyRenderRequest,
             return .failure(.badDimensions)
         }
         // Checked expansion cost before allocating the RGBA buffer.
-        guard pixelCount * 4 <= Int64(limits.maxPayloadBytes) else {
-            return .failure(.exceedsPayloadLimit(bytes: Int(min(pixelCount * 4, Int64(Int.max))), limit: limits.maxPayloadBytes))
+        guard pixelCount * 4 <= Int64(limits.maxDecodedRasterBytes) else {
+            return .failure(.exceedsDecodedRasterLimit(bytes: Int(min(pixelCount * 4, Int64(Int.max))), limit: limits.maxDecodedRasterBytes))
         }
         var rgba = Data(count: Int(pixelCount * 4))
         rgba.withUnsafeMutableBytes { (dst: UnsafeMutableRawBufferPointer) in
@@ -631,6 +650,11 @@ private func rasterizeHostedSource(request: HostedKittyRenderRequest,
         }
         guard Int64(request.rawWidth) * Int64(request.rawHeight) * 4 == Int64(rawData.count) else {
             return .failure(.badDimensions)
+        }
+        // Raw RGBA is already wire-capped, but an explicit raster check
+        // keeps tight decoded-raster budgets effective for every format.
+        guard rawData.count <= limits.maxDecodedRasterBytes else {
+            return .failure(.exceedsDecodedRasterLimit(bytes: rawData.count, limit: limits.maxDecodedRasterBytes))
         }
         return .success((rawData, request.rawWidth, request.rawHeight))
     default:
@@ -699,12 +723,12 @@ private func finishHostedPrepare(request: HostedKittyRenderRequest,
     let (targetWidth, widthOverflow) = request.columns.multipliedReportingOverflow(by: cellWidth)
     let (targetHeight, heightOverflow) = request.rows.multipliedReportingOverflow(by: cellHeight)
     guard !widthOverflow, !heightOverflow else {
-        return .failure(.exceedsRenderedLimit(bytes: Int.max, limit: limits.maxPayloadBytes))
+        return .failure(.exceedsRenderedLimit(bytes: Int.max, limit: limits.maxRenderedBytes))
     }
     guard let scaled = HostedKittyImageDecoder.scaleToCanvas(source: croppedRGBA, sourceWidth: croppedWidth, sourceHeight: croppedHeight,
                                                              targetWidth: targetWidth, targetHeight: targetHeight,
-                                                             maxBytes: limits.maxPayloadBytes) else {
-        return .failure(.exceedsRenderedLimit(bytes: Int.max, limit: limits.maxPayloadBytes))
+                                                             maxBytes: limits.maxRenderedBytes) else {
+        return .failure(.exceedsRenderedLimit(bytes: Int.max, limit: limits.maxRenderedBytes))
     }
     guard let stripes = HostedKittyImageDecoder.sliceStripes(canvas: scaled.bytes, canvasWidth: scaled.width, canvasHeight: scaled.height,
                                                              stripeHeight: cellHeight, rowCount: request.rows) else {

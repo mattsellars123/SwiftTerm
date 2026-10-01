@@ -289,23 +289,32 @@ final class HostedKittyReviewFixTests {
     }
 
     @Test func testRawExpansionCheckedBeforeAlloc() {
-        // 30000-byte RGB source expanding to 40000-byte RGBA under a 35000
-        // budget: the source fits, the expansion does not.
+        // 30000-byte RGB source expanding to 40000-byte RGBA: the source
+        // fits the 35000-byte wire budget, the expansion does not fit the
+        // 35000-byte decoded-raster budget. Wire and raster are separate
+        // bounds: the same wire budget with the default raster admits it.
         let payload = Data(count: 30_000).base64EncodedString()
         let ticket = HostedKittyRenderRequest(epoch: 0, originLinesTop: 0, imageId: 1, imageNumber: nil,
                                               placementId: 1, columns: 2, rows: 1, zIndex: 0,
                                               pixelOffsetX: 0, pixelOffsetY: 0, format: 24,
                                               rawWidth: 100, rawHeight: 100, compression: nil,
                                               base64Payload: Array(payload.utf8), isAlternateBuffer: false)
-        let tight = HostedKittyGraphicsLimits(maxPayloadBytes: 35_000)
+        let tight = HostedKittyGraphicsLimits(maxPayloadBytes: 35_000, maxDecodedRasterBytes: 35_000)
         guard case .failure(let error) = prepareHostedKittyRender(ticket, limits: tight) else {
             Issue.record("expected expansion-limit failure")
             return
         }
-        guard case .exceedsPayloadLimit = error else {
-            Issue.record("expected exceedsPayloadLimit, got \(error)")
+        guard case .exceedsDecodedRasterLimit = error else {
+            Issue.record("expected exceedsDecodedRasterLimit, got \(error)")
             return
         }
+        // Separation control: the wire budget alone admits the same ticket
+        // once the decoded raster fits the default raster bound.
+        guard case .success(let admitted) = prepareHostedKittyRender(ticket, limits: HostedKittyGraphicsLimits(maxPayloadBytes: 35_000)) else {
+            Issue.record("expected wire-budget admission under the default raster bound")
+            return
+        }
+        #expect(admitted.rgba.count == 40_000)
         guard case .success(let image) = prepareHostedKittyRender(ticket) else {
             Issue.record("expected successful control expansion")
             return
@@ -330,20 +339,21 @@ final class HostedKittyReviewFixTests {
 
 #if canImport(ImageIO)
     @Test func testPNGDimensionsCheckedBeforeDecode() {
-        // 1000x1000 solid PNG (~5KB encoded, 4MB raster). Header cost exceeds
-        // a 1MB budget: rejected from properties alone, never rasterized.
+        // 1000x1000 solid PNG (~5KB encoded, 4MB raster). The file fits any
+        // wire budget; the 4MB header cost exceeds a 1MB decoded-raster
+        // budget: rejected from properties alone, never rasterized.
         let ticket = HostedKittyRenderRequest(epoch: 0, originLinesTop: 0, imageId: 1, imageNumber: nil,
                                               placementId: 1, columns: 2, rows: 1, zIndex: 0,
                                               pixelOffsetX: 0, pixelOffsetY: 0, format: 100,
                                               rawWidth: 0, rawHeight: 0, compression: nil,
                                               base64Payload: Array(Self.png1000.utf8), isAlternateBuffer: false)
-        let tight = HostedKittyGraphicsLimits(maxPayloadBytes: 1_000_000)
+        let tight = HostedKittyGraphicsLimits(maxDecodedRasterBytes: 1_000_000)
         guard case .failure(let error) = prepareHostedKittyRender(ticket, limits: tight) else {
             Issue.record("expected header-gated failure")
             return
         }
-        guard case .exceedsPayloadLimit = error else {
-            Issue.record("expected exceedsPayloadLimit, got \(error)")
+        guard case .exceedsDecodedRasterLimit = error else {
+            Issue.record("expected exceedsDecodedRasterLimit, got \(error)")
             return
         }
         // Control: the same header decodes under default limits.
@@ -357,7 +367,9 @@ final class HostedKittyReviewFixTests {
 
     @Test func testRenderedCostAdmittedBeforeStripes() {
         // 2x2 source is tiny, but 3x2 cells at 8x16px render 3072 bytes:
-        // a 100-byte rendered budget rejects before stripe allocation.
+        // a 100-byte rendered budget rejects before stripe allocation,
+        // while the same 100-byte wire budget (source is 16 bytes) admits
+        // the raster.
         let ticket = HostedKittyRenderRequest(epoch: 0, originLinesTop: 0, imageId: 1, imageNumber: nil,
                                               placementId: 1, columns: 3, rows: 2, zIndex: 0,
                                               pixelOffsetX: 0, pixelOffsetY: 0, format: 32,
@@ -365,7 +377,7 @@ final class HostedKittyReviewFixTests {
                                               base64Payload: Array(solidRed2x2().utf8),
                                               isAlternateBuffer: false,
                                               cellWidthPx: 8, cellHeightPx: 16)
-        let tight = HostedKittyGraphicsLimits(maxPayloadBytes: 100)
+        let tight = HostedKittyGraphicsLimits(maxPayloadBytes: 100, maxRenderedBytes: 100)
         guard case .failure(let error) = prepareHostedKittyRender(ticket, limits: tight) else {
             Issue.record("expected rendered-limit failure")
             return

@@ -353,6 +353,44 @@ final class KittyGraphicsLifecycleTests {
         #expect(harness.delegate.sentData.isEmpty)
     }
 
+    /// Continuation inheritance fills only OMITTED `a=`/`t=` fields: Pi's
+    /// bare `m=`-only chunks complete the retained transfer, but an
+    /// explicitly supplied unsupported action or transmission mid-transfer
+    /// rejects before any pending mutation -- no bytes appended, no extra
+    /// jobs or placements.
+    @Test func testHostedContinuationHonorsExplicitActionAndTransmission() {
+        let harness = TerminalTestHarness.makeTerminal()
+        let terminal = harness.terminal
+        terminal.options.hostedKittyTwoPhaseRendering = true
+        func responses() -> String {
+            String(bytes: harness.delegate.sentData.flatMap { $0 }, encoding: .utf8) ?? ""
+        }
+
+        let firstChunk = Data([1, 2, 3]).base64EncodedString()
+        terminal.feed(text: "\u{1b}_Ga=T,f=24,s=2,v=1,c=1,r=1,i=1,q=2,m=1;\(firstChunk)\u{1b}\\")
+        let retainedBytes = terminal.kittyGraphicsState.pending?.base64Payload.count
+        #expect(retainedBytes == firstChunk.count)
+
+        // Explicit delete mid-transfer: rejected, partial preserved.
+        terminal.feed(text: "\u{1b}_Ga=d,d=A\u{1b}\\")
+        #expect(responses().contains("ENOTSUP"))
+        #expect(terminal.kittyGraphicsState.pending?.base64Payload.count == retainedBytes)
+        #expect(terminal.takePendingHostedKittyRenders().isEmpty)
+        #expect(terminal.kittyGraphicsState.placementsByKey.isEmpty)
+
+        // Explicit file transmission mid-transfer: rejected, partial preserved.
+        terminal.feed(text: "\u{1b}_Ga=T,f=24,t=f,i=1\u{1b}\\")
+        #expect(terminal.kittyGraphicsState.pending?.base64Payload.count == retainedBytes)
+        #expect(terminal.takePendingHostedKittyRenders().isEmpty)
+        #expect(terminal.kittyGraphicsState.placementsByKey.isEmpty)
+
+        // Bare Pi-style final chunk completes exactly one ticket.
+        let finalChunk = Data([4, 5, 6]).base64EncodedString()
+        terminal.feed(text: "\u{1b}_Gm=0;\(finalChunk)\u{1b}\\")
+        #expect(terminal.takePendingHostedKittyRenders().count == 1)
+        #expect(terminal.kittyGraphicsState.pending == nil)
+    }
+
     /// Test quiet mode suppresses response (q=1)
     /// From Ghostty: "kittygfx more chunks with q=1"
     @Test func testQuietModeSuppressesResponse() {

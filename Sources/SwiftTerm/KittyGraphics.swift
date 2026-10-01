@@ -109,6 +109,13 @@ struct KittyGraphicsControl {
     let rows: Int
     let cursorPolicy: Int
     let deleteMode: Character?
+    /// Whether this chunk explicitly supplied `a=` / `t=`. Continuation
+    /// chunks normally carry only `m=`; omitted fields inherit the opening
+    /// chunk's retained controls, but an explicitly supplied field is always
+    /// honored, so a mid-transfer `a=d` (or `t=f`) can never be mistaken
+    /// for the transfer's final chunk.
+    let actionSpecified: Bool
+    let transmissionSpecified: Bool
 }
 
 enum KittyGraphicsPayload {
@@ -266,13 +273,15 @@ extension Terminal {
         // or placement state changes, so a rejection retains zero bytes,
         // jobs, or state. Flag-off behavior is unchanged below.
         if options.hostedKittyTwoPhaseRendering {
-            // Kitty continuation chunks normally contain only `m=`. They
-            // inherit their action and transmission from the opening chunk,
-            // which is retained in `pending` until the final chunk arrives.
-            // Validate that effective control rather than rejecting a valid
-            // direct transmission as the default `a=t` continuation.
-            let effectiveControl = kittyGraphicsState.pending?.control ?? control
-            guard effectiveControl.action == "T", effectiveControl.transmission == "d" else {
+            // Kitty continuation chunks normally contain only `m=`. Omitted
+            // `a=`/`t=` fields inherit the opening chunk's retained controls;
+            // explicitly supplied fields are always honored, so a mid-transfer
+            // `a=d` (or `t=f`) rejects here before any pending mutation instead
+            // of being consumed as the transfer's final chunk.
+            let pendingControl = kittyGraphicsState.pending?.control
+            let effectiveAction = control.actionSpecified ? control.action : (pendingControl?.action ?? control.action)
+            let effectiveTransmission = control.transmissionSpecified ? control.transmission : (pendingControl?.transmission ?? control.transmission)
+            guard effectiveAction == "T", effectiveTransmission == "d" else {
                 sendStrictHostedRejection(control: control)
                 return
             }
@@ -443,7 +452,9 @@ extension Terminal {
                                            columns: columns,
                                            rows: rows,
                                            cursorPolicy: cursorPolicy,
-                                           deleteMode: deleteMode)
+                                           deleteMode: deleteMode,
+                                           actionSpecified: values["a"] != nil,
+                                           transmissionSpecified: values["t"] != nil)
         return (control, payload)
     }
 
